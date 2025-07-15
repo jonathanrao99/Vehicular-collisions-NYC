@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  nyc-collisions-app:
+    build: .
+    container_name: nyc-collisions-analysis
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - ENVIRONMENT=production
+      - PYTHONPATH=/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - nyc-collisions-network
+
+networks:
+  nyc-collisions-network:
+    driver: bridge
+
+volumes:
+  data:
+    driver: local
+  logs:
+    driver: local
