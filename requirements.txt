@@ -1,5 +1,6 @@
-pandas==1.4.3
-streamlit==1.11.0
-numpy==1.23.1
-plotly==5.9.0
-pydeck==0.7.1
+pandas>=2.0.0
+streamlit>=1.28.0
+numpy>=1.24.0
+plotly>=5.15.0
+pydeck>=0.8.0
+python-dateutil>=2.8.0
