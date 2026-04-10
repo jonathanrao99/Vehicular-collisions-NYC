@@ -1015,7 +1015,7 @@ def render_prediction_ui(model_info: Dict[str, Any], collisions_view: pd.DataFra
                 full,
                 key=f"risk_bp_{i}",
                 help=f"Approximate center of {full} ({plat:.4f}, {plon:.4f})",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.risk_lat = plat
                 st.session_state.risk_lon = plon
@@ -1137,7 +1137,7 @@ def render_prediction_ui(model_info: Dict[str, Any], collisions_view: pd.DataFra
         )
         mt = model_info.get("metrics_table")
         if mt:
-            st.dataframe(pd.DataFrame(mt).T.round(4), use_container_width=True)
+            st.dataframe(pd.DataFrame(mt).T.round(4), width="stretch")
         else:
             for name, info in model_info.get("models", {}).items():
                 st.write(f"- {name}: {info['score']:.3f}")
@@ -1185,7 +1185,7 @@ def render_time_charts(view: pd.DataFrame) -> None:
         )
     )
     fig.update_xaxes(title_text="Hour of day (0–23)", dtick=2)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if px is None:
         return
@@ -1205,7 +1205,7 @@ def render_time_charts(view: pd.DataFrame) -> None:
         fig2.update_layout(
             title={"text": "Crashes by weekday", "font": {"size": 16}, "x": 0.5, "xanchor": "center"}
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
     with c2:
         monthly = view.groupby(["month", "month_name"]).size().reset_index(name="count")
         monthly = monthly.sort_values("month")
@@ -1223,7 +1223,7 @@ def render_time_charts(view: pd.DataFrame) -> None:
             title={"text": "Crashes by month", "font": {"size": 16}, "x": 0.5, "xanchor": "center"}
         )
         fig3.update_xaxes(tickangle=35)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
 
     cond = view.groupby(["is_weekend", "is_rush_hour", "is_night"])["is_serious"].mean().reset_index()
     cond["label"] = cond.apply(
@@ -1252,7 +1252,7 @@ def render_time_charts(view: pd.DataFrame) -> None:
     )
     fig4.update_yaxes(tickformat=".0%")
     fig4.update_xaxes(tickangle=25)
-    st.plotly_chart(fig4, use_container_width=True)
+    st.plotly_chart(fig4, width="stretch")
 
 
 def _factor_text_usable(s: str) -> bool:
@@ -1335,7 +1335,7 @@ def render_pattern_charts(view: pd.DataFrame) -> None:
             )
         )
         fig_y.update_xaxes(title_text="Year", dtick=1)
-        st.plotly_chart(fig_y, use_container_width=True)
+        st.plotly_chart(fig_y, width="stretch")
 
     fac_col = "CONTRIBUTING FACTOR VEHICLE 1"
     veh_col = "VEHICLE TYPE CODE 1"
@@ -1384,7 +1384,7 @@ def render_pattern_charts(view: pd.DataFrame) -> None:
                         yaxis={"title": ""},
                         coloraxis_colorbar={"title": "Serious share"},
                     )
-                    st.plotly_chart(fig_f, use_container_width=True)
+                    st.plotly_chart(fig_f, width="stretch")
             else:
                 st.info("Not enough labeled factors in this slice to chart.")
         elif px is None:
@@ -1433,7 +1433,7 @@ def render_pattern_charts(view: pd.DataFrame) -> None:
                         yaxis={"title": ""},
                         coloraxis_colorbar={"title": "Serious share"},
                     )
-                    st.plotly_chart(fig_v, use_container_width=True)
+                    st.plotly_chart(fig_v, width="stretch")
             else:
                 st.info("Not enough vehicle-type rows in this slice to chart.")
         elif px is None:
@@ -1481,7 +1481,7 @@ def render_pattern_charts(view: pd.DataFrame) -> None:
                     yaxis={"title": ""},
                     coloraxis_colorbar={"title": "Serious share"},
                 )
-                st.plotly_chart(fig_s, use_container_width=True)
+                st.plotly_chart(fig_s, width="stretch")
 
 
 def render_geo(view: pd.DataFrame) -> None:
@@ -1518,7 +1518,7 @@ def render_geo(view: pd.DataFrame) -> None:
             f1.update_layout(
                 **_plotly_layout_base("Crashes by borough", "Count (n)", None),
             )
-            st.plotly_chart(f1, use_container_width=True)
+            st.plotly_chart(f1, width="stretch")
         with g2:
             f2 = go.Figure(
                 data=[
@@ -1535,7 +1535,7 @@ def render_geo(view: pd.DataFrame) -> None:
                 **_plotly_layout_base("Serious share by borough", "Serious share", None),
             )
             f2.update_yaxes(tickformat=".0%")
-            st.plotly_chart(f2, use_container_width=True)
+            st.plotly_chart(f2, width="stretch")
 
     if not MAP_AVAILABLE:
         st.info("Install `folium` to show the map.")
@@ -1652,7 +1652,7 @@ def render_model_tab(
                 xgb_d = st.number_input("Boost max_depth", 2, 20, int(cur.get("xgb_max_depth", 8)), 1)
                 xgb_lr = st.number_input("Boost learning rate", 0.01, 0.50, float(cur.get("xgb_learning_rate", 0.1)), 0.01)
 
-            submitted = st.form_submit_button("Apply settings & retrain", use_container_width=True)
+            submitted = st.form_submit_button("Apply settings & retrain", width="stretch")
 
         if submitted:
             new_cfg: Dict[str, Any] = {
@@ -1706,7 +1706,7 @@ def render_model_tab(
     mt = train_pack.get("metrics_table") or {}
     if mt:
         df_m = pd.DataFrame(mt).T.round(4)
-        st.dataframe(df_m, use_container_width=True)
+        st.dataframe(df_m, width="stretch")
 
     probas = train_pack.get("probas_test") or {}
     y_test = train_pack.get("y_test")
@@ -1714,12 +1714,12 @@ def render_model_tab(
         v1, v2 = st.columns(2)
         with v1:
             try:
-                st.plotly_chart(_plot_roc_curves(y_test, probas), use_container_width=True)
+                st.plotly_chart(_plot_roc_curves(y_test, probas), width="stretch")
             except ValueError:
                 st.caption("ROC curves need both classes on the holdout set.")
         with v2:
             if mt:
-                st.plotly_chart(_plot_metrics_comparison(mt), use_container_width=True)
+                st.plotly_chart(_plot_metrics_comparison(mt), width="stretch")
 
     active = st.session_state.get("active_ml_model", train_pack.get("best_model_name"))
     if active not in train_pack["models"]:
@@ -1732,7 +1732,7 @@ def render_model_tab(
                 proba_one,
                 f"Confusion matrix @0.5 — {active}",
             ),
-            use_container_width=True,
+            width="stretch",
         )
 
     st.markdown(
@@ -1759,7 +1759,7 @@ def render_model_tab(
         fig_imp.update_xaxes(title_text="Importance (tree-based)")
         fig_imp.update_yaxes(title_text="")
         fig_imp.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_imp, use_container_width=True)
+        st.plotly_chart(fig_imp, width="stretch")
     else:
         st.caption("This estimator doesn’t expose feature importances here.")
 
@@ -1851,7 +1851,7 @@ def render_model_tab(
 
     show_prev = st.toggle("Preview first 200 scored rows", value=False)
     if show_prev:
-        st.dataframe(export_dl.head(200), use_container_width=True, height=280)
+        st.dataframe(export_dl.head(200), width="stretch", height=280)
 
     csv_buf = io.StringIO()
     export_dl.to_csv(csv_buf, index=True, index_label="source_row_index")
@@ -1860,7 +1860,7 @@ def render_model_tab(
         data=csv_buf.getvalue(),
         file_name="nyc_crashes_scored_by_model.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 
     card = _model_card_payload(forward, data, pack)
@@ -1876,7 +1876,7 @@ def render_model_tab(
         data=json_bytes,
         file_name="nyc_crash_model_report.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -1904,7 +1904,7 @@ def main() -> None:
             help="With a local CSV: random sample (seed 42) when the file is larger. "
             "Without a CSV (e.g. cloud): newest records from the API, up to this many.",
         )
-        if st.button("Reload file (clear cache)", use_container_width=True):
+        if st.button("Reload file (clear cache)", width="stretch"):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
