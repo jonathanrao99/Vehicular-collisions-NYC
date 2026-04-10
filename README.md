@@ -8,7 +8,7 @@ Streamlit UI and a Jupyter notebook for NYC’s published [Motor Vehicle Collisi
 
 ## What’s in the repo
 
-- `streamlit_app.py` — dashboard: filters, summary, risk tab, time charts, map, CSV export  
+- `streamlit_app.py` — dashboard: filters, summary, risk tab, time charts, map, model scoring + report  
 - `nyc_collisions_advanced_analysis.ipynb` — same CSV, EDA and models (optional TensorFlow section if you install it)  
 - `requirements.txt` — Python dependencies  
 - `.streamlit/config.toml` — light theme and accent color  
@@ -33,7 +33,7 @@ jupyter notebook nyc_collisions_advanced_analysis.ipynb   # optional
 1. **Risk** — time, place, and a probability from the best model on your loaded sample (holdout ROC AUC).  
 2. **Time** — hourly volume, weekday and month charts, serious share by context.  
 3. **Map** — borough bars and a Folium heat layer (sampled for speed).  
-4. **Export** — download the currently filtered rows.
+4. **Model** — tune holdout size, which algorithms run, and tree hyperparameters; compare ROC AUC / accuracy / F1 on the holdout set; pick which fitted model powers the Risk tab; batch-score the filtered slice (CSV) and download a JSON report.
 
 Open the in-app “Notes” expander for row counts, sampling, label definitions, and limits.
 

@@ -8,6 +8,7 @@ Custom CSS below is scoped to classes prefixed with nyc- for maintainability.
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,7 +41,31 @@ CHART = {
     "serious_line": "#b45309",
     "grid": "#e2e8f0",
     "bar_volume": "#cbd5e1",
+    "roc_palette": ["#0f766e", "#b45309", "#6366f1", "#db2777", "#64748b"],
 }
+
+# Default ML training — serialized to JSON for @st.cache_resource keying
+DEFAULT_ML_CONFIG: Dict[str, Any] = {
+    "use_coords": True,
+    "test_size": 0.2,
+    "train_rf": True,
+    "train_gb": True,
+    "train_xgb": True,
+    "train_lgb": True,
+    "rf_n_estimators": 150,
+    "rf_max_depth": 15,
+    "rf_min_samples_leaf": 5,
+    "gb_n_estimators": 100,
+    "gb_learning_rate": 0.1,
+    "gb_max_depth": 8,
+    "xgb_n_estimators": 100,
+    "xgb_max_depth": 8,
+    "xgb_learning_rate": 0.1,
+    "lgb_n_estimators": 100,
+    "lgb_max_depth": 8,
+    "lgb_learning_rate": 0.1,
+}
+DEFAULT_ML_CONFIG_JSON = json.dumps(DEFAULT_ML_CONFIG, sort_keys=True)
 
 # Folium borough markers — distinct hues + labels in popup (not color-only)
 BOROUGH_MAP_STYLE: List[Tuple[str, float, float, str]] = [
@@ -117,12 +142,27 @@ except ImportError:
 
 try:
     from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import (
+        accuracy_score,
+        confusion_matrix,
+        f1_score,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+        roc_curve,
+    )
     from sklearn.model_selection import train_test_split
 
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+    roc_auc_score = None  # type: ignore[misc, assignment]
+    accuracy_score = None  # type: ignore[misc, assignment]
+    confusion_matrix = None  # type: ignore[misc, assignment]
+    f1_score = None  # type: ignore[misc, assignment]
+    precision_score = None  # type: ignore[misc, assignment]
+    recall_score = None  # type: ignore[misc, assignment]
+    roc_curve = None  # type: ignore[misc, assignment]
 
 try:
     import xgboost as xgb
@@ -160,19 +200,55 @@ def get_app_config() -> Dict[str, Any]:
         "map_sample_size": 10_000,
         "risk_map_crash_max": 5_000,
         "chart_height": 420,
+        "model_export_max_rows": 50_000,
     }
 
 
-def _plotly_layout_base(title: str, y_primary: str, y_secondary: Optional[str] = None) -> Dict[str, Any]:
+def _plotly_layout_base(
+    title: str,
+    y_primary: str,
+    y_secondary: Optional[str] = None,
+    *,
+    legend_below: bool = True,
+) -> Dict[str, Any]:
+    """Plotly layout shared across charts. Legend defaults below the plot so it never covers the title."""
+    h = get_app_config()["chart_height"]
+    margin = {"t": 52, "l": 56, "r": 56, "b": 48}
+    if legend_below:
+        margin["b"] = 96
+        legend: Dict[str, Any] = {
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.22,
+            "xanchor": "center",
+            "x": 0.5,
+            "font": {"size": 11},
+        }
+    else:
+        legend = {
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+            "font": {"size": 11},
+        }
+        margin["t"] = 64
     layout: Dict[str, Any] = {
-        "title": {"text": title, "font": {"size": 16}},
+        "title": {
+            "text": title,
+            "font": {"size": 16},
+            "x": 0.5,
+            "xanchor": "center",
+            "pad": {"t": 4, "b": 10},
+        },
         "font": {"family": "sans-serif", "color": "#334155"},
         "paper_bgcolor": "white",
         "plot_bgcolor": "white",
-        "height": get_app_config()["chart_height"],
-        "margin": {"t": 48, "b": 48, "l": 56, "r": 56},
+        "height": h,
+        "margin": margin,
         "xaxis": {"showgrid": True, "gridcolor": CHART["grid"], "zeroline": False},
-        "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        "legend": legend,
     }
     layout["yaxis"] = {
         "title": y_primary,
@@ -320,10 +396,26 @@ def apply_view_filters(
     return v
 
 
-@st.cache_resource
-def train_models(data: pd.DataFrame) -> Dict[str, Any]:
-    if not ML_AVAILABLE or data.empty:
+def _binary_metrics_at_threshold(y_true: np.ndarray, proba: np.ndarray) -> Dict[str, float]:
+    pred = (proba >= 0.5).astype(np.int32)
+    return {
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "recall": float(recall_score(y_true, pred, zero_division=0)),
+        "f1": float(f1_score(y_true, pred, zero_division=0)),
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def train_models(data: pd.DataFrame, config_json: str) -> Dict[str, Any]:
+    """Train selected estimators; ``config_json`` keys the cache so UI changes retrain."""
+    if not ML_AVAILABLE or data.empty or roc_auc_score is None:
         return {}
+    try:
+        cfg = json.loads(config_json)
+    except json.JSONDecodeError:
+        cfg = json.loads(DEFAULT_ML_CONFIG_JSON)
+
     try:
         feature_cols = [
             "hour",
@@ -334,67 +426,267 @@ def train_models(data: pd.DataFrame) -> Dict[str, Any]:
             "is_night",
             "is_holiday_season",
         ]
-        if "LATITUDE" in data.columns and "LONGITUDE" in data.columns:
+        use_coords = bool(cfg.get("use_coords", True))
+        if use_coords and "LATITUDE" in data.columns and "LONGITUDE" in data.columns:
             feature_cols.extend(["LATITUDE", "LONGITUDE"])
+
         ml_data = data[feature_cols + ["is_serious"]].dropna()
         if len(ml_data) < 1000:
             return {}
+
         X = ml_data[feature_cols].astype(np.float32)
         y = ml_data["is_serious"].astype(np.int8)
+        ts = float(cfg.get("test_size", 0.2))
+        ts = min(0.45, max(0.1, ts))
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+            X, y, test_size=ts, random_state=42, stratify=y
         )
+        y_test_np = y_test.to_numpy(dtype=np.int8)
+
         models: Dict[str, Any] = {}
-        rf = RandomForestClassifier(
-            n_estimators=150,
-            max_depth=15,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            random_state=42,
-            n_jobs=-1,
-            class_weight="balanced",
-        )
-        rf.fit(X_train, y_train)
-        models["Random Forest"] = {"model": rf, "score": roc_auc_score(y_test, rf.predict_proba(X_test)[:, 1])}
-        gb = GradientBoostingClassifier(
-            n_estimators=100, learning_rate=0.1, max_depth=8, random_state=42
-        )
-        gb.fit(X_train, y_train)
-        models["Gradient Boosting"] = {
-            "model": gb,
-            "score": roc_auc_score(y_test, gb.predict_proba(X_test)[:, 1]),
-        }
-        if XGB_AVAILABLE and xgb is not None:
+        if cfg.get("train_rf", True):
+            rf = RandomForestClassifier(
+                n_estimators=int(cfg.get("rf_n_estimators", 150)),
+                max_depth=int(cfg.get("rf_max_depth", 15)),
+                min_samples_split=10,
+                min_samples_leaf=int(cfg.get("rf_min_samples_leaf", 5)),
+                random_state=42,
+                n_jobs=-1,
+                class_weight="balanced",
+            )
+            rf.fit(X_train, y_train)
+            p = rf.predict_proba(X_test)[:, 1]
+            models["Random Forest"] = {
+                "model": rf,
+                "score": float(roc_auc_score(y_test, p)),
+                "metrics_05": _binary_metrics_at_threshold(y_test_np, p),
+            }
+        if cfg.get("train_gb", True):
+            gb = GradientBoostingClassifier(
+                n_estimators=int(cfg.get("gb_n_estimators", 100)),
+                learning_rate=float(cfg.get("gb_learning_rate", 0.1)),
+                max_depth=int(cfg.get("gb_max_depth", 8)),
+                random_state=42,
+            )
+            gb.fit(X_train, y_train)
+            p = gb.predict_proba(X_test)[:, 1]
+            models["Gradient Boosting"] = {
+                "model": gb,
+                "score": float(roc_auc_score(y_test, p)),
+                "metrics_05": _binary_metrics_at_threshold(y_test_np, p),
+            }
+        if cfg.get("train_xgb", True) and XGB_AVAILABLE and xgb is not None:
             xm = xgb.XGBClassifier(
-                n_estimators=100,
-                max_depth=8,
-                learning_rate=0.1,
+                n_estimators=int(cfg.get("xgb_n_estimators", 100)),
+                max_depth=int(cfg.get("xgb_max_depth", 8)),
+                learning_rate=float(cfg.get("xgb_learning_rate", 0.1)),
                 random_state=42,
                 n_jobs=-1,
                 eval_metric="logloss",
             )
             xm.fit(X_train, y_train)
-            models["XGBoost"] = {"model": xm, "score": roc_auc_score(y_test, xm.predict_proba(X_test)[:, 1])}
-        if LGB_AVAILABLE and lgb is not None:
+            p = xm.predict_proba(X_test)[:, 1]
+            models["XGBoost"] = {
+                "model": xm,
+                "score": float(roc_auc_score(y_test, p)),
+                "metrics_05": _binary_metrics_at_threshold(y_test_np, p),
+            }
+        if cfg.get("train_lgb", True) and LGB_AVAILABLE and lgb is not None:
             lm = lgb.LGBMClassifier(
-                n_estimators=100,
-                max_depth=8,
-                learning_rate=0.1,
+                n_estimators=int(cfg.get("lgb_n_estimators", 100)),
+                max_depth=int(cfg.get("lgb_max_depth", 8)),
+                learning_rate=float(cfg.get("lgb_learning_rate", 0.1)),
                 random_state=42,
                 n_jobs=-1,
                 verbosity=-1,
             )
             lm.fit(X_train, y_train)
-            models["LightGBM"] = {"model": lm, "score": roc_auc_score(y_test, lm.predict_proba(X_test)[:, 1])}
+            p = lm.predict_proba(X_test)[:, 1]
+            models["LightGBM"] = {
+                "model": lm,
+                "score": float(roc_auc_score(y_test, p)),
+                "metrics_05": _binary_metrics_at_threshold(y_test_np, p),
+            }
+
+        if not models:
+            return {"_train_error": "No models selected (or XGBoost/LightGBM unavailable)."}
+
+        probas_test: Dict[str, np.ndarray] = {}
+        metrics_table: Dict[str, Any] = {}
+        for name, info in models.items():
+            m = info["model"]
+            pr = m.predict_proba(X_test)[:, 1]
+            probas_test[name] = np.asarray(pr, dtype=np.float64)
+            row = {"roc_auc": info["score"], **info["metrics_05"]}
+            metrics_table[name] = row
+
         best = max(models.keys(), key=lambda k: models[k]["score"])
         return {
             "models": models,
             "best_model": models[best]["model"],
             "best_model_name": best,
             "feature_names": feature_cols,
+            "y_test": y_test_np,
+            "probas_test": probas_test,
+            "metrics_table": metrics_table,
+            "train_config": cfg,
+            "n_train": int(len(X_train)),
+            "n_test": int(len(X_test)),
         }
     except Exception as exc:  # noqa: BLE001
         return {"_train_error": str(exc)}
+
+
+def _score_view_with_best_model(
+    view: pd.DataFrame,
+    model_info: Dict[str, Any],
+) -> Optional[pd.DataFrame]:
+    """Subset of rows with complete model features plus ``p_serious`` from the best estimator."""
+    if not model_info or "best_model" not in model_info:
+        return None
+    fn: List[str] = model_info["feature_names"]
+    if any(c not in view.columns for c in fn):
+        return None
+    need = fn + (["is_serious"] if "is_serious" in view.columns else [])
+    sub = view[need].dropna()
+    if sub.empty:
+        return None
+    X = sub[fn].astype(np.float32)
+    model = model_info["best_model"]
+    proba = model.predict_proba(X)[:, 1]
+    out = sub.copy()
+    out["p_serious"] = proba.astype(np.float64)
+    return out
+
+
+def _parse_ml_config_json(s: str) -> Dict[str, Any]:
+    try:
+        out = json.loads(s)
+        return out if isinstance(out, dict) else json.loads(DEFAULT_ML_CONFIG_JSON)
+    except (json.JSONDecodeError, TypeError):
+        return json.loads(DEFAULT_ML_CONFIG_JSON)
+
+
+def _plot_metrics_comparison(metrics_table: Dict[str, Any]) -> go.Figure:
+    names = list(metrics_table.keys())
+    fig = go.Figure()
+    for metric, label in [
+        ("roc_auc", "ROC AUC"),
+        ("accuracy", "Accuracy @0.5"),
+        ("f1", "F1 @0.5"),
+    ]:
+        fig.add_trace(
+            go.Bar(
+                name=label,
+                x=names,
+                y=[float(metrics_table[n].get(metric, 0)) for n in names],
+                hovertemplate="%{x}<br>" + label + ": %{y:.4f}<extra></extra>",
+            )
+        )
+    base_layout = _plotly_layout_base("Holdout metrics by model", "Score", None)
+    base_layout.pop("legend", None)
+    fig.update_layout(
+        **base_layout,
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35, x=0.5, xanchor="center"),
+    )
+    fig.update_layout(margin=dict(t=52, b=120, l=56, r=56))
+    return fig
+
+
+def _plot_roc_curves(y_test: np.ndarray, probas_test: Dict[str, np.ndarray]) -> go.Figure:
+    fig = go.Figure()
+    palette = CHART["roc_palette"]
+    for i, (name, proba) in enumerate(probas_test.items()):
+        fpr, tpr, _ = roc_curve(y_test, proba)
+        color = palette[i % len(palette)]
+        fig.add_trace(
+            go.Scatter(
+                x=fpr,
+                y=tpr,
+                mode="lines",
+                name=name,
+                line=dict(width=2, color=color),
+                hovertemplate=name + "<br>FPR %{x:.3f}<br>TPR %{y:.3f}<extra></extra>",
+            )
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=[0, 1],
+            y=[0, 1],
+            mode="lines",
+            name="Random",
+            line=dict(dash="dash", color=CHART["neutral"], width=1),
+            hovertemplate="Baseline<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        **_plotly_layout_base("ROC curves (holdout set)", "True positive rate", None),
+    )
+    fig.update_xaxes(title_text="False positive rate", constrain="domain")
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    return fig
+
+
+def _plot_confusion_matrix_fig(y_true: np.ndarray, proba: np.ndarray, title: str) -> go.Figure:
+    pred = (proba >= 0.5).astype(np.int32)
+    cm = confusion_matrix(y_true, pred)
+    labels = ["Not serious", "Serious"]
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=cm,
+            x=[f"Pred {x}" for x in labels],
+            y=[f"Actual {x}" for x in labels],
+            colorscale=[[0, "#f1f5f9"], [1, CHART["accent"]]],
+            text=cm,
+            texttemplate="%{text}",
+            hovertemplate="%{y} %{x}<br>Count %{z}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        **_plotly_layout_base(title, "", None),
+    )
+    fig.update_xaxes(side="bottom")
+    return fig
+
+
+def _model_card_payload(
+    model_info: Dict[str, Any],
+    data: pd.DataFrame,
+    pack: Dict[str, Any],
+) -> Dict[str, Any]:
+    scores = {
+        name: round(float(info["score"]), 5)
+        for name, info in (model_info.get("models") or {}).items()
+        if isinstance(info, dict) and "score" in info
+    }
+    metrics_full: Dict[str, Any] = {}
+    for n, d in (model_info.get("metrics_table") or {}).items():
+        if isinstance(d, dict):
+            metrics_full[n] = {
+                k: round(float(v), 5) if isinstance(v, (float, int, np.floating, np.integer)) else v
+                for k, v in d.items()
+            }
+    if not metrics_full:
+        metrics_full = {n: {"roc_auc": scores.get(n)} for n in scores}
+    return {
+        "generated_at_local": datetime.now().isoformat(timespec="seconds"),
+        "label": (
+            "Serious crash: at least one fatality or two or more people injured "
+            "(same rule as the Risk tab)."
+        ),
+        "training_sample_rows_after_clean": int(len(data)),
+        "rows_read_from_csv": int(pack.get("rows_read") or 0),
+        "feature_columns_in_order": list(model_info.get("feature_names") or []),
+        "best_model_name_by_roc_auc": model_info.get("best_model_name"),
+        "scoring_model_in_ui": model_info.get("scoring_model_label"),
+        "holdout_metric": "ROC AUC on stratified test split (random_state=42); test_size from Model tab",
+        "train_config": model_info.get("train_config"),
+        "n_train": model_info.get("n_train"),
+        "n_test": model_info.get("n_test"),
+        "model_metrics_holdout": metrics_full,
+        "model_test_roc_auc": scores,
+    }
 
 
 def render_methodology_block(path: str, pack: Dict[str, Any]) -> None:
@@ -412,7 +704,7 @@ def render_methodology_block(path: str, pack: Dict[str, Any]) -> None:
             f"""
 <div class="nyc-method">
 <p>This app reads NYC’s published motor-vehicle crash file and builds charts and a simple classifier on top.
-Use the filters above, then open each tab for the risk model, time charts, a heat map, or a CSV download.</p>
+Use the filters above, then open each tab for the risk model, time charts, a heat map, or batch model scores and a small model report.</p>
 <ul>
 <li><strong>Dataset:</strong> <a href="{NYC_OPEN_DATA_URL}" target="_blank" rel="noopener">Motor Vehicle Collisions — Crashes</a> on NYC Open Data.</li>
 <li><strong>Local file:</strong> <code>{path}</code> · modified <strong>{modified}</strong> · size about <strong>{size_mb}</strong>.</li>
@@ -422,7 +714,7 @@ Use the filters above, then open each tab for the risk model, time charts, a hea
 <li><strong>Risk score (heat map):</strong> A homemade index from injuries, deaths, and time of day. It isn’t from the city.</li>
 <li><strong>Map tab:</strong> At most {get_app_config()["map_sample_size"]:,} points with coordinates, for speed.</li>
 <li><strong>Risk tab map:</strong> Up to {get_app_config()["risk_map_crash_max"]:,} points from your current filters, clustered. Amber = serious label, gray = not.</li>
-<li><strong>Model:</strong> Trained on the loaded sample; we report ROC AUC on a 20% holdout set. Useful for exploration, not for policy or engineering decisions.</li>
+<li><strong>Model:</strong> Trained on the full cleaned sample from the sidebar cap; holdout fraction and hyperparameters are configurable on the Model tab (cached per setting). The Model tab re-scores filtered rows that have every feature filled, plots ROC and confusion on the holdout set, shows importances when the estimator supports them, and offers a scored CSV plus a JSON report (row cap {get_app_config()["model_export_max_rows"]:,}). For exploration only.</li>
 </ul>
 </div>
 """,
@@ -631,6 +923,9 @@ def render_prediction_ui(model_info: Dict[str, Any], collisions_view: pd.DataFra
         st.error(f"Prediction error: {exc}")
         return
 
+    scorer = model_info.get("scoring_model_label") or model_info.get("best_model_name", "")
+    st.caption(f"Estimator for this number: {scorer} (picker is above the tabs).")
+
     if proba >= 0.7:
         label, hint = "High", "Above 70% on this model’s scale."
     elif proba >= 0.4:
@@ -649,7 +944,7 @@ def render_prediction_ui(model_info: Dict[str, Any], collisions_view: pd.DataFra
             st.metric(
                 "P(serious)",
                 f"{proba:.1%}",
-                help="Estimated probability of the serious label. Model chosen by ROC AUC on a held-out test set.",
+                help="Estimated probability of the serious label for the estimator you selected above the tabs.",
             )
         with m2:
             st.metric("Bucket", label, help=hint)
@@ -672,10 +967,23 @@ def render_prediction_ui(model_info: Dict[str, Any], collisions_view: pd.DataFra
             st.caption("Install the `folium` package to show the map.")
 
     with st.expander("Models and test scores", expanded=False):
-        st.write(f"Using: {model_info['best_model_name']}")
-        st.caption("ROC AUC on 20% of the data held out after training. Higher means better ranking, not perfect predictions.")
-        for name, info in model_info.get("models", {}).items():
-            st.write(f"- {name}: {info['score']:.3f}")
+        leader = model_info.get("best_model_name", "")
+        scorer = model_info.get("scoring_model_label", leader)
+        st.write(f"Scoring with: {scorer}")
+        if scorer != leader:
+            st.caption(f"Highest ROC AUC on the holdout set this run: {leader}.")
+        tc = model_info.get("train_config") or {}
+        ts = float(tc.get("test_size", 0.2))
+        st.caption(
+            f"Holdout fraction {ts:.0%} (stratified, seed 42). ROC AUC measures ranking, not “accuracy.” "
+            "Accuracy / F1 / precision / recall below use a 0.5 probability cutoff."
+        )
+        mt = model_info.get("metrics_table")
+        if mt:
+            st.dataframe(pd.DataFrame(mt).T.round(4), use_container_width=True)
+        else:
+            for name, info in model_info.get("models", {}).items():
+                st.write(f"- {name}: {info['score']:.3f}")
 
 
 def render_time_charts(view: pd.DataFrame) -> None:
@@ -684,7 +992,8 @@ def render_time_charts(view: pd.DataFrame) -> None:
         unsafe_allow_html=True,
     )
     st.caption(
-        "First chart: crash count by hour (bars) and share that were serious (line). Left axis is count, right axis is share."
+        "Bars are how many crashes; the line is the share we labeled serious (death or 2+ hurt). "
+        "Left axis count, right axis share."
     )
     h = view.groupby("hour").agg({"is_serious": ["count", "mean"]}).round(4)
     h.columns = ["total", "serious_rate"]
@@ -704,7 +1013,7 @@ def render_time_charts(view: pd.DataFrame) -> None:
         go.Scatter(
             x=h["hour"],
             y=h["serious_rate"],
-            name="Serious share",
+            name="How ugly it got",
             mode="lines+markers",
             line=dict(color=CHART["serious_line"], width=2),
             hovertemplate="Hour %{x}<br>Serious share %{y:.1%}<extra></extra>",
@@ -713,7 +1022,7 @@ def render_time_charts(view: pd.DataFrame) -> None:
     )
     fig.update_layout(
         **_plotly_layout_base(
-            "Crashes by hour: volume and serious share",
+            "Crashes by hour — volume vs. how ugly it got",
             "Crash count (n)",
             "Serious share (proportion)",
         )
@@ -736,7 +1045,9 @@ def render_time_charts(view: pd.DataFrame) -> None:
             color_discrete_sequence=[CHART["accent"]],
         )
         fig2.update_layout(**{k: v for k, v in _plotly_layout_base("", "Count", None).items() if k != "title"})
-        fig2.update_layout(title={"text": "Crashes by weekday", "font": {"size": 16}})
+        fig2.update_layout(
+            title={"text": "Crashes by weekday", "font": {"size": 16}, "x": 0.5, "xanchor": "center"}
+        )
         st.plotly_chart(fig2, use_container_width=True)
     with c2:
         monthly = view.groupby(["month", "month_name"]).size().reset_index(name="count")
@@ -751,7 +1062,9 @@ def render_time_charts(view: pd.DataFrame) -> None:
         )
         fig3.update_traces(line=dict(color=CHART["accent"]))
         fig3.update_layout(**{k: v for k, v in _plotly_layout_base("", "Count", None).items() if k != "title"})
-        fig3.update_layout(title={"text": "Crashes by month", "font": {"size": 16}})
+        fig3.update_layout(
+            title={"text": "Crashes by month", "font": {"size": 16}, "x": 0.5, "xanchor": "center"}
+        )
         fig3.update_xaxes(tickangle=35)
         st.plotly_chart(fig3, use_container_width=True)
 
@@ -772,10 +1085,246 @@ def render_time_charts(view: pd.DataFrame) -> None:
         color_continuous_scale=[[0, CHART["bar_volume"]], [1, CHART["serious_line"]]],
     )
     fig4.update_layout(**{k: v for k, v in _plotly_layout_base("", "Serious share", None).items() if k != "title"})
-    fig4.update_layout(title={"text": "Serious share by weekend, rush, night", "font": {"size": 16}})
+    fig4.update_layout(
+        title={
+            "text": "How ugly it got: weekend, rush, night",
+            "font": {"size": 16},
+            "x": 0.5,
+            "xanchor": "center",
+        }
+    )
     fig4.update_yaxes(tickformat=".0%")
     fig4.update_xaxes(tickangle=25)
     st.plotly_chart(fig4, use_container_width=True)
+
+
+def _factor_text_usable(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    x = s.strip()
+    if len(x) < 2:
+        return False
+    xl = x.lower()
+    if xl in ("nan", "none", "null"):
+        return False
+    return "unspecified" not in xl
+
+
+def render_pattern_charts(view: pd.DataFrame) -> None:
+    """Extra breakdowns: year trend, contributing factors, vehicle types, vulnerable road users."""
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">More patterns</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Factors and vehicle types come straight from the file (vehicle 1 fields). "
+        "Counts are descriptive—not causes proved in a crash."
+    )
+
+    ped_c = "NUMBER OF PEDESTRIANS INJURED"
+    cyc_c = "NUMBER OF CYCLIST INJURED"
+    mot_c = "NUMBER OF MOTORIST INJURED"
+    vm = st.columns(3)
+    with vm[0]:
+        if ped_c in view.columns:
+            n = (pd.to_numeric(view[ped_c], errors="coerce").fillna(0) > 0).sum()
+            st.metric("Crashes with a pedestrian hurt", f"{n:,}")
+        else:
+            st.metric("Crashes with a pedestrian hurt", "—")
+    with vm[1]:
+        if cyc_c in view.columns:
+            n = (pd.to_numeric(view[cyc_c], errors="coerce").fillna(0) > 0).sum()
+            st.metric("Crashes with a cyclist hurt", f"{n:,}")
+        else:
+            st.metric("Crashes with a cyclist hurt", "—")
+    with vm[2]:
+        if mot_c in view.columns:
+            n = (pd.to_numeric(view[mot_c], errors="coerce").fillna(0) > 0).sum()
+            st.metric("Crashes with a driver hurt", f"{n:,}")
+        else:
+            st.metric("Crashes with a driver hurt", "—")
+
+    yr_counts = view.groupby("year").size().reset_index(name="count")
+    if len(yr_counts) > 1:
+        yr_ser = view.groupby("year")["is_serious"].mean().reset_index()
+        yr_m = yr_counts.merge(yr_ser, on="year")
+        fig_y = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_y.add_trace(
+            go.Bar(
+                x=yr_m["year"],
+                y=yr_m["count"],
+                name="Crashes",
+                marker_color=CHART["bar_volume"],
+                hovertemplate="Year %{x}<br>Count %{y:,}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig_y.add_trace(
+            go.Scatter(
+                x=yr_m["year"],
+                y=yr_m["is_serious"],
+                name="How ugly it got",
+                mode="lines+markers",
+                line=dict(color=CHART["serious_line"], width=2),
+                hovertemplate="Year %{x}<br>Serious share %{y:.1%}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+        fig_y.update_layout(
+            **_plotly_layout_base(
+                "Crashes by year — volume vs. how ugly it got",
+                "Crash count (n)",
+                "Serious share (proportion)",
+            )
+        )
+        fig_y.update_xaxes(title_text="Year", dtick=1)
+        st.plotly_chart(fig_y, use_container_width=True)
+
+    fac_col = "CONTRIBUTING FACTOR VEHICLE 1"
+    veh_col = "VEHICLE TYPE CODE 1"
+    pc1, pc2 = st.columns(2)
+
+    with pc1:
+        if fac_col in view.columns and px is not None:
+            sub = view.copy()
+            sub["_fac"] = sub[fac_col].astype(str).str.strip()
+            sub = sub[sub["_fac"].map(_factor_text_usable)]
+            min_n = max(30, min(200, len(sub) // 200))
+            if len(sub) >= min_n:
+                g = sub.groupby("_fac", as_index=False).agg(
+                    n=("is_serious", "size"),
+                    serious=("is_serious", "mean"),
+                )
+                g = g[g["n"] >= min_n].sort_values("n", ascending=False).head(14)
+                if g.empty:
+                    st.info("No single factor met the minimum count in this slice.")
+                else:
+                    g["label"] = g["_fac"].str.slice(0, 44)
+                    fig_f = px.bar(
+                        g.sort_values("n"),
+                        x="n",
+                        y="label",
+                        orientation="h",
+                        title="Top reported factors (vehicle 1)",
+                        labels={"n": "Crashes (n)", "label": "Factor"},
+                        color="serious",
+                        color_continuous_scale=[[0, CHART["bar_volume"]], [1, CHART["serious_line"]]],
+                    )
+                    fig_f.update_layout(
+                        **{
+                            k: v
+                            for k, v in _plotly_layout_base("", "Crashes (n)", None).items()
+                            if k not in ("title", "yaxis", "yaxis2")
+                        }
+                    )
+                    fig_f.update_layout(
+                        title={
+                            "text": "What people wrote down as a factor (vehicle 1)",
+                            "font": {"size": 15},
+                            "x": 0.5,
+                            "xanchor": "center",
+                        },
+                        yaxis={"title": ""},
+                        coloraxis_colorbar={"title": "Serious share"},
+                    )
+                    st.plotly_chart(fig_f, use_container_width=True)
+            else:
+                st.info("Not enough labeled factors in this slice to chart.")
+        elif px is None:
+            st.caption("Install plotly express for factor charts.")
+
+    with pc2:
+        if veh_col in view.columns and px is not None:
+            sub = view.copy()
+            sub["_veh"] = sub[veh_col].astype(str).str.strip()
+            sub = sub[sub["_veh"].map(_factor_text_usable)]
+            min_n = max(30, min(200, len(sub) // 200))
+            if len(sub) >= min_n:
+                g = sub.groupby("_veh", as_index=False).agg(
+                    n=("is_serious", "size"),
+                    serious=("is_serious", "mean"),
+                )
+                g = g[g["n"] >= min_n].sort_values("n", ascending=False).head(14)
+                if g.empty:
+                    st.info("No vehicle type met the minimum count in this slice.")
+                else:
+                    g["label"] = g["_veh"].str.slice(0, 44)
+                    fig_v = px.bar(
+                        g.sort_values("n"),
+                        x="n",
+                        y="label",
+                        orientation="h",
+                        title="Top vehicle types (vehicle 1)",
+                        labels={"n": "Crashes (n)", "label": "Vehicle type"},
+                        color="serious",
+                        color_continuous_scale=[[0, CHART["bar_volume"]], [1, CHART["serious_line"]]],
+                    )
+                    fig_v.update_layout(
+                        **{
+                            k: v
+                            for k, v in _plotly_layout_base("", "Crashes (n)", None).items()
+                            if k not in ("title", "yaxis", "yaxis2")
+                        }
+                    )
+                    fig_v.update_layout(
+                        title={
+                            "text": "Vehicle types showing up most (vehicle 1)",
+                            "font": {"size": 15},
+                            "x": 0.5,
+                            "xanchor": "center",
+                        },
+                        yaxis={"title": ""},
+                        coloraxis_colorbar={"title": "Serious share"},
+                    )
+                    st.plotly_chart(fig_v, use_container_width=True)
+            else:
+                st.info("Not enough vehicle-type rows in this slice to chart.")
+        elif px is None:
+            pass
+
+    on_street = "ON STREET NAME"
+    if on_street in view.columns and px is not None:
+        sub = view.copy()
+        sub["_st"] = sub[on_street].astype(str).str.strip()
+        sub = sub[sub["_st"].map(_factor_text_usable)]
+        min_n = max(20, min(150, len(sub) // 300))
+        if len(sub) >= min_n:
+            g = sub.groupby("_st", as_index=False).agg(
+                n=("is_serious", "size"),
+                serious=("is_serious", "mean"),
+            )
+            g = g[g["n"] >= min_n].sort_values("n", ascending=False).head(12)
+            if g.empty:
+                st.info("No street name met the minimum count in this slice.")
+            else:
+                g["label"] = g["_st"].str.slice(0, 40)
+                fig_s = px.bar(
+                    g.sort_values("n"),
+                    x="n",
+                    y="label",
+                    orientation="h",
+                    labels={"n": "Crashes (n)", "label": "Street"},
+                    color="serious",
+                    color_continuous_scale=[[0, CHART["bar_volume"]], [1, CHART["serious_line"]]],
+                )
+                fig_s.update_layout(
+                    **{
+                        k: v
+                        for k, v in _plotly_layout_base("", "Crashes (n)", None).items()
+                        if k not in ("title", "yaxis", "yaxis2")
+                    }
+                )
+                fig_s.update_layout(
+                    title={
+                        "text": "Streets with the most crashes in your filters",
+                        "font": {"size": 15},
+                        "x": 0.5,
+                        "xanchor": "center",
+                    },
+                    yaxis={"title": ""},
+                    coloraxis_colorbar={"title": "Serious share"},
+                )
+                st.plotly_chart(fig_s, use_container_width=True)
 
 
 def render_geo(view: pd.DataFrame) -> None:
@@ -869,24 +1418,239 @@ def render_geo(view: pd.DataFrame) -> None:
     components.html(m._repr_html_(), height=480)
 
 
-def render_data_export(view: pd.DataFrame, full: pd.DataFrame) -> None:
+def render_model_tab(
+    view: pd.DataFrame,
+    data: pd.DataFrame,
+    training_result: Dict[str, Any],
+    pack: Dict[str, Any],
+) -> None:
+    if not ML_AVAILABLE:
+        st.info("Install scikit-learn to use training controls, charts, and downloads on this tab.")
+        return
+
+    te = training_result.get("_train_error") if isinstance(training_result, dict) else None
+    train_pack = {
+        k: v
+        for k, v in (training_result or {}).items()
+        if k != "_train_error"
+    }
+
     st.markdown(
-        '<p class="nyc-section-kicker nyc-kicker-tight">Export</p>',
+        '<p class="nyc-section-kicker nyc-kicker-tight">Model</p>',
         unsafe_allow_html=True,
     )
     st.caption(
-        f"{len(view):,} rows with your current filters (out of {len(full):,} after cleaning). "
-        "The CSV matches what the charts use."
+        "Training always uses the full cleaned sample from the sidebar row cap. "
+        "Change settings below and submit to retrain (cached per configuration). "
+        "Pick which fitted estimator drives the Risk tab using the selector above the tabs."
     )
-    u1, u2, u3 = st.columns(3)
-    with u1:
-        st.metric("Injuries (sum)", f"{view['total_injured'].sum():,.0f}")
-    with u2:
-        st.metric("Fatalities (sum)", f"{view['total_killed'].sum():,.0f}")
-    with u3:
-        st.metric("Serious share", f"{view['is_serious'].mean():.1%}")
 
-    cols = [
+    cur = _parse_ml_config_json(st.session_state.get("ml_config_json", DEFAULT_ML_CONFIG_JSON))
+    with st.expander("Training setup", expanded=True):
+        with st.form("ml_train_form"):
+            st.markdown("**Data & split**")
+            use_coords = st.checkbox(
+                "Include latitude & longitude as features",
+                value=bool(cur.get("use_coords", True)),
+            )
+            test_size = st.slider(
+                "Holdout fraction (test set)",
+                min_value=0.10,
+                max_value=0.40,
+                value=float(cur.get("test_size", 0.2)),
+                step=0.05,
+                help="Stratified split, random_state=42.",
+            )
+            st.markdown("**Which models to fit**")
+            c0, c1 = st.columns(2)
+            with c0:
+                tr_rf = st.checkbox("Random Forest", value=bool(cur.get("train_rf", True)))
+                tr_gb = st.checkbox("Gradient Boosting", value=bool(cur.get("train_gb", True)))
+            with c1:
+                tr_xgb = st.checkbox(
+                    "XGBoost",
+                    value=bool(cur.get("train_xgb", True)),
+                    disabled=not XGB_AVAILABLE,
+                )
+                tr_lgb = st.checkbox(
+                    "LightGBM",
+                    value=bool(cur.get("train_lgb", True)),
+                    disabled=not LGB_AVAILABLE,
+                )
+            st.markdown("**Hyperparameters**")
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                st.caption("Random Forest")
+                rf_n = st.number_input("RF n_estimators", 50, 500, int(cur.get("rf_n_estimators", 150)), 25)
+                rf_d = st.number_input("RF max_depth", 3, 40, int(cur.get("rf_max_depth", 15)), 1)
+                rf_leaf = st.number_input("RF min_samples_leaf", 1, 50, int(cur.get("rf_min_samples_leaf", 5)), 1)
+            with r2:
+                st.caption("Gradient Boosting")
+                gb_n = st.number_input("GB n_estimators", 20, 400, int(cur.get("gb_n_estimators", 100)), 10)
+                gb_lr = st.number_input("GB learning rate", 0.01, 0.50, float(cur.get("gb_learning_rate", 0.1)), 0.01)
+                gb_d = st.number_input("GB max_depth", 2, 20, int(cur.get("gb_max_depth", 8)), 1)
+            with r3:
+                st.caption("XGB / LGB (when enabled)")
+                xgb_n = st.number_input("Boost n_estimators", 20, 400, int(cur.get("xgb_n_estimators", 100)), 10)
+                xgb_d = st.number_input("Boost max_depth", 2, 20, int(cur.get("xgb_max_depth", 8)), 1)
+                xgb_lr = st.number_input("Boost learning rate", 0.01, 0.50, float(cur.get("xgb_learning_rate", 0.1)), 0.01)
+
+            submitted = st.form_submit_button("Apply settings & retrain", use_container_width=True)
+
+        if submitted:
+            new_cfg: Dict[str, Any] = {
+                "use_coords": use_coords,
+                "test_size": float(test_size),
+                "train_rf": tr_rf,
+                "train_gb": tr_gb,
+                "train_xgb": tr_xgb and XGB_AVAILABLE,
+                "train_lgb": tr_lgb and LGB_AVAILABLE,
+                "rf_n_estimators": int(rf_n),
+                "rf_max_depth": int(rf_d),
+                "rf_min_samples_leaf": int(rf_leaf),
+                "gb_n_estimators": int(gb_n),
+                "gb_learning_rate": float(gb_lr),
+                "gb_max_depth": int(gb_d),
+                "xgb_n_estimators": int(xgb_n),
+                "xgb_max_depth": int(xgb_d),
+                "xgb_learning_rate": float(xgb_lr),
+                "lgb_n_estimators": int(xgb_n),
+                "lgb_max_depth": int(xgb_d),
+                "lgb_learning_rate": float(xgb_lr),
+            }
+            st.session_state.ml_config_json = json.dumps(new_cfg, sort_keys=True)
+            st.rerun()
+
+    if te:
+        st.error(f"Training error: {te}")
+
+    if (
+        not train_pack
+        or "models" not in train_pack
+        or "best_model" not in train_pack
+        or not train_pack["models"]
+    ):
+        if not te:
+            st.info(
+                "No models loaded yet. You need scikit-learn, at least 1,000 rows after cleaning, "
+                "and at least one model enabled above."
+            )
+        return
+
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Holdout evaluation</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"{train_pack.get('n_train', 0):,} train rows · {train_pack.get('n_test', 0):,} test rows. "
+        f"Highest ROC AUC this run: {train_pack.get('best_model_name', '')}."
+    )
+
+    mt = train_pack.get("metrics_table") or {}
+    if mt:
+        df_m = pd.DataFrame(mt).T.round(4)
+        st.dataframe(df_m, use_container_width=True)
+
+    probas = train_pack.get("probas_test") or {}
+    y_test = train_pack.get("y_test")
+    if y_test is not None and len(y_test) and probas and roc_curve is not None:
+        v1, v2 = st.columns(2)
+        with v1:
+            try:
+                st.plotly_chart(_plot_roc_curves(y_test, probas), use_container_width=True)
+            except ValueError:
+                st.caption("ROC curves need both classes on the holdout set.")
+        with v2:
+            if mt:
+                st.plotly_chart(_plot_metrics_comparison(mt), use_container_width=True)
+
+    active = st.session_state.get("active_ml_model", train_pack.get("best_model_name"))
+    if active not in train_pack["models"]:
+        active = train_pack["best_model_name"]
+    proba_one = probas.get(active) if probas else None
+    if y_test is not None and proba_one is not None and confusion_matrix is not None:
+        st.plotly_chart(
+            _plot_confusion_matrix_fig(
+                y_test,
+                proba_one,
+                f"Confusion matrix @0.5 — {active}",
+            ),
+            use_container_width=True,
+        )
+
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Feature importance (scoring model)</p>',
+        unsafe_allow_html=True,
+    )
+    scoring_model = train_pack["models"][active]["model"]
+    if hasattr(scoring_model, "feature_importances_"):
+        names = train_pack["feature_names"]
+        imp = np.asarray(scoring_model.feature_importances_, dtype=float)
+        order = np.argsort(imp)[::-1]
+        fig_imp = go.Figure(
+            go.Bar(
+                x=imp[order],
+                y=[names[i] for i in order],
+                orientation="h",
+                marker_color=CHART["accent"],
+                hovertemplate="%{y}<br>Importance %{x:.4f}<extra></extra>",
+            )
+        )
+        fig_imp.update_layout(
+            **_plotly_layout_base(f"Feature importance — {active}", "", None),
+        )
+        fig_imp.update_xaxes(title_text="Importance (tree-based)")
+        fig_imp.update_yaxes(title_text="")
+        fig_imp.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_imp, use_container_width=True)
+    else:
+        st.caption("This estimator doesn’t expose feature importances here.")
+
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Batch scores & report</p>',
+        unsafe_allow_html=True,
+    )
+    cfg = get_app_config()
+    max_rows = int(cfg["model_export_max_rows"])
+
+    forward = {
+        **train_pack,
+        "best_model": scoring_model,
+        "best_model_name": train_pack.get("best_model_name"),
+        "scoring_model_label": active,
+    }
+
+    st.caption(
+        f"Using {active} for P(serious) on filtered rows with complete features "
+        "(same as Risk tab). Not for deployment."
+    )
+
+    scored = _score_view_with_best_model(view, forward)
+    if scored is None or scored.empty:
+        st.warning(
+            "No rows in the current filter could be scored (missing coordinates or other inputs). "
+            "Widen filters, turn on lat/lon in training, or set severity to All."
+        )
+        return
+
+    n_scored = len(scored)
+    st.metric("Rows scored in this filter", f"{n_scored:,}")
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Mean P(serious)", f"{scored['p_serious'].mean():.1%}")
+    with m2:
+        if "is_serious" in scored.columns:
+            st.metric("Actual serious share", f"{scored['is_serious'].mean():.1%}")
+    with m3:
+        if "is_serious" in scored.columns and n_scored > 0 and roc_auc_score is not None:
+            try:
+                auc = roc_auc_score(scored["is_serious"], scored["p_serious"])
+                st.metric("ROC AUC (this filter)", f"{auc:.3f}")
+            except Exception:  # noqa: BLE001
+                st.metric("ROC AUC (this filter)", "—")
+
+    extra_cols = [
         c
         for c in [
             "CRASH_DATE",
@@ -894,26 +1658,67 @@ def render_data_export(view: pd.DataFrame, full: pd.DataFrame) -> None:
             "borough",
             "LATITUDE",
             "LONGITUDE",
+            "year",
             "total_injured",
             "total_killed",
-            "is_serious",
-            "risk_score",
-            "hour",
-            "year",
         ]
         if c in view.columns
     ]
-    show = st.toggle("Show first 500 rows", value=False)
-    if show:
-        st.dataframe(view[cols].head(500), use_container_width=True, height=320)
+    export_df = scored.copy()
+    for c in extra_cols:
+        export_df[c] = view.loc[export_df.index, c].values
+
+    out_cols = (
+        extra_cols
+        + [c for c in forward["feature_names"] if c not in extra_cols]
+        + (["is_serious"] if "is_serious" in export_df.columns else [])
+        + ["p_serious"]
+    )
+    out_cols = [c for c in out_cols if c in export_df.columns]
+    export_trim = export_df[out_cols].copy()
+
+    cap = st.number_input(
+        "Max rows in scored CSV",
+        min_value=1,
+        max_value=max_rows,
+        value=min(25_000, max_rows, n_scored),
+        step=1_000,
+        help=f"Hard ceiling {max_rows:,}. If the filter returns more, we take a random sample (seed 42).",
+    )
+    cap_i = int(min(cap, n_scored))
+    if n_scored > cap_i:
+        export_dl = export_trim.sample(n=cap_i, random_state=42)
+        st.caption(f"CSV uses a random {cap_i:,} of {n_scored:,} scored rows.")
+    else:
+        export_dl = export_trim
+
+    show_prev = st.toggle("Preview first 200 scored rows", value=False)
+    if show_prev:
+        st.dataframe(export_dl.head(200), use_container_width=True, height=280)
 
     csv_buf = io.StringIO()
-    view[cols].to_csv(csv_buf, index=False)
+    export_dl.to_csv(csv_buf, index=True, index_label="source_row_index")
     st.download_button(
-        label="Download CSV",
+        label="Download scored CSV",
         data=csv_buf.getvalue(),
-        file_name="nyc_collisions_filtered.csv",
+        file_name="nyc_crashes_scored_by_model.csv",
         mime="text/csv",
+        use_container_width=True,
+    )
+
+    card = _model_card_payload(forward, data, pack)
+    card["scored_export"] = {
+        "filter_row_count_in_view": int(len(view)),
+        "rows_with_complete_features": int(n_scored),
+        "csv_rows_downloaded": int(len(export_dl)),
+        "columns_in_csv": list(export_dl.columns),
+    }
+    json_bytes = json.dumps(card, indent=2)
+    st.download_button(
+        label="Download model report (JSON)",
+        data=json_bytes,
+        file_name="nyc_crash_model_report.json",
+        mime="application/json",
         use_container_width=True,
     )
 
@@ -924,7 +1729,8 @@ def main() -> None:
     st.markdown('<p class="nyc-page-title">NYC motor vehicle crashes</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="nyc-lead">Browse the city’s crash export: filter by year and borough, look at timing and maps, '
-        "try a simple model that guesses how often a crash counts as serious, and download a CSV if you need it. "
+        "try a simple model that guesses how often a crash counts as serious, and pull batch scores plus a JSON model "
+        "report from the Model tab when training succeeds. "
         "Public data only; this isn’t official analysis from DOT or NYPD.</p>",
         unsafe_allow_html=True,
     )
@@ -1026,29 +1832,58 @@ def main() -> None:
     st.divider()
     render_methodology_block(DATA_FILE, pack)
 
-    model_info: Dict[str, Any] = {}
+    st.session_state.setdefault("ml_config_json", DEFAULT_ML_CONFIG_JSON)
+
+    raw_train: Dict[str, Any] = {}
+    train_pack: Dict[str, Any] = {}
     if ML_AVAILABLE:
+        cfg_j = st.session_state["ml_config_json"]
         with st.spinner("Training models…"):
-            raw_models = train_models(data)
-        # Do not mutate @st.cache_resource return value
-        te = raw_models.get("_train_error") if isinstance(raw_models, dict) else None
-        model_info = {
+            raw_train = train_models(data, cfg_j)
+        te = raw_train.get("_train_error") if isinstance(raw_train, dict) else None
+        train_pack = {
             k: v
-            for k, v in (raw_models or {}).items()
+            for k, v in (raw_train or {}).items()
             if k != "_train_error"
         }
         if te:
-            st.warning("Model training failed. Charts, map, and export still work; the risk tab won’t show a score.")
-            st.caption(te)
-            model_info = {}
-        elif model_info:
+            st.warning(
+                "Model training failed. Charts, map, and the Model tab still work; the Risk tab won’t show a score."
+            )
+            st.caption(str(te))
+            train_pack = {}
+        elif train_pack.get("models"):
+            tc = train_pack.get("train_config") or {}
+            ts = float(tc.get("test_size", 0.2))
             st.caption(
-                f"Fit on {len(data):,} cleaned rows; 20% held out for scoring. "
-                f"Best ROC AUC: {model_info.get('best_model_name', '')}."
+                f"Fit on {len(data):,} cleaned rows; {ts:.0%} held out for scoring. "
+                f"Best ROC AUC: {train_pack.get('best_model_name', '')}."
             )
 
-    tab_risk, tab_time, tab_map, tab_data = st.tabs(
-        ["Risk", "Time", "Map", "Export"]
+    if train_pack.get("models"):
+        opts = list(train_pack["models"].keys())
+        if st.session_state.get("active_ml_model") not in opts:
+            st.session_state.active_ml_model = train_pack["best_model_name"]
+        st.selectbox(
+            "Model for Risk predictions & batch scores",
+            options=opts,
+            key="active_ml_model",
+        )
+
+    model_info: Dict[str, Any] = {}
+    if train_pack.get("models"):
+        act = st.session_state.get("active_ml_model", train_pack["best_model_name"])
+        if act not in train_pack["models"]:
+            act = train_pack["best_model_name"]
+            st.session_state.active_ml_model = act
+        model_info = {
+            **train_pack,
+            "best_model": train_pack["models"][act]["model"],
+            "scoring_model_label": act,
+        }
+
+    tab_risk, tab_time, tab_map, tab_model = st.tabs(
+        ["Risk", "Time", "Map", "Model"]
     )
     with tab_risk:
         render_prediction_ui(model_info, view)
@@ -1057,10 +1892,11 @@ def main() -> None:
             st.info("Need at least 10 rows for these charts. Relax the filters.")
         else:
             render_time_charts(view)
+            render_pattern_charts(view)
     with tab_map:
         render_geo(view)
-    with tab_data:
-        render_data_export(view, data)
+    with tab_model:
+        render_model_tab(view, data, raw_train if ML_AVAILABLE else {}, pack)
 
     st.divider()
     st.caption(
