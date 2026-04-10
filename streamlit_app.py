@@ -12,6 +12,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -469,9 +470,11 @@ def load_collision_data_from_api(max_rows: int, app_token: str) -> Dict[str, Any
         offset = 0
         while len(rows_accum) < want:
             chunk_sz = min(SOCRATA_PAGE_SIZE, want - len(rows_accum))
+            # Space in SoQL order must be percent-encoded (raw space breaks urllib on some runtimes).
+            order_param = quote("crash_date DESC", safe="")
             url = (
                 f"{SOCRATA_CRASHES_URL}?$limit={chunk_sz}&$offset={offset}"
-                "&$order=crash_date DESC"
+                f"&$order={order_param}"
             )
             chunk = _http_get_socrata_json(url, app_token)
             if not isinstance(chunk, list) or not chunk:

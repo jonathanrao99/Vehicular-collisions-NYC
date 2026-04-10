@@ -21,6 +21,23 @@ Optional: put `Motor_Vehicle_Collisions_-_Crashes.csv` in the project root (giti
 - `pip install -r requirements.txt`  
 - Download the crashes CSV from [NYC Open Data](https://data.cityofnewyork.us/Public-Safety/Motor-Vehicle-Collisions-Crashes/h9gi-nx95) or the [Kaggle mirror](https://www.kaggle.com/datasets/tush32/motor-vehicle-collisions-crashes) and name it as above.
 
+### NYC Open Data API credentials (optional)
+
+If you [sign in](https://data.cityofnewyork.us/) and open [Developer / app tokens](https://data.cityofnewyork.us/profile/edit/developer_settings), you’ll get:
+
+| What NYC shows | Use in this project? |
+|----------------|----------------------|
+| **Application token** (app token) | **Yes.** The app sends it as `X-App-Token` when downloading data from the API (better rate limits on Streamlit Cloud). |
+| **Secret token** | **No** for this app. Public crash data is read with GET requests; the secret is for other Socrata features. **Never commit** the secret. |
+
+**Streamlit Cloud:** App → **Settings** → **Secrets** → add:
+
+```toml
+NYC_OPEN_DATA_APP_TOKEN = "paste-your-application-token-here"
+```
+
+**Local:** create `.streamlit/secrets.toml` with the same line (that file is gitignored). Alternatively set the environment variable `NYC_OPEN_DATA_APP_TOKEN`.
+
 ## Run
 
 ```bash
@@ -59,7 +76,7 @@ streamlit run streamlit_app.py --server.port 8501
 ### Streamlit Cloud
 1. Push code to GitHub (you do **not** need to commit the CSV).
 2. Connect the repository to [share.streamlit.io](https://share.streamlit.io) and deploy.
-3. Optional: under app **Secrets**, add `NYC_OPEN_DATA_APP_TOKEN` with a [free app token](https://data.cityofnewyork.us/profile/edit/developer_settings) if you hit rate limits when loading large row caps.
+3. **Recommended:** In app **Secrets**, set `NYC_OPEN_DATA_APP_TOKEN` to your **application token** from [NYC developer settings](https://data.cityofnewyork.us/profile/edit/developer_settings) (see *NYC Open Data API credentials* above). You do **not** need to put the secret token in this app.
 
 ### Docker (optional)
 ```bash
@@ -80,7 +97,8 @@ Issues and PRs welcome. For bugs, include OS, Python version, and how to reprodu
 - **CSV not found (local)** — file name and location must match above; check permissions. On Streamlit Cloud, missing CSV is expected; the app uses the live API.  
 - **Models** — `pip install scikit-learn`; optional `xgboost`, `lightgbm`. On some Macs you may need OpenMP (`brew install libomp`) for XGBoost.  
 - **Maps** — `pip install folium`; tiles need network access.  
-- **Slow or OOM** — lower `max_rows` in the sidebar and smaller ML sample sizes.
+- **Slow or OOM** — lower `max_rows` in the sidebar and smaller ML sample sizes.  
+- **API / throttling on Cloud** — add `NYC_OPEN_DATA_APP_TOKEN` (application token only) in Streamlit Secrets; keep the NYC **secret** token out of the repo.
 
 ## Performance
 
