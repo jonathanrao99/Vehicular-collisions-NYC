@@ -1,1049 +1,1073 @@
 """
-NYC Motor Vehicle Collisions AI Dashboard
-Advanced analytics and machine learning for traffic safety analysis
+NYC motor vehicle collisions — Streamlit explorer and risk model UI.
+
+Theme tokens live in .streamlit/config.toml (see README → UI theme).
+Custom CSS below is scoped to classes prefixed with nyc- for maintainability.
 """
 
-import pandas as pd
-import streamlit as st
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from __future__ import annotations
+
+import io
 import os
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
 import warnings
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-# Page configuration
-st.set_page_config(
-    page_title="NYC Collisions AI Dashboard",
-    page_icon="🚗",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-    menu_items={
-        'About': "NYC Motor Vehicle Collisions AI Dashboard - Advanced analytics powered by machine learning"
-    }
+# -----------------------------------------------------------------------------
+# Paths & data source (methodology / freshness)
+# -----------------------------------------------------------------------------
+DATA_FILE = "Motor_Vehicle_Collisions_-_Crashes.csv"
+NYC_OPEN_DATA_URL = (
+    "https://data.cityofnewyork.us/Public-Safety/"
+    "Motor-Vehicle-Collisions-Crashes/h9gi-nx95"
 )
 
-# Import dependencies with graceful fallback
+# Plotly semantic colors — align with [theme] primaryColor in config.toml (#0f766e)
+CHART = {
+    "accent": "#0f766e",
+    "accent_dark": "#115e59",
+    "neutral": "#64748b",
+    "volume": "#475569",
+    "serious_line": "#b45309",
+    "grid": "#e2e8f0",
+    "bar_volume": "#cbd5e1",
+}
+
+# Folium borough markers — distinct hues + labels in popup (not color-only)
+BOROUGH_MAP_STYLE: List[Tuple[str, float, float, str]] = [
+    ("Manhattan", 40.7589, -73.9851, "#0072B2"),
+    ("Brooklyn", 40.6782, -73.9442, "#E69F00"),
+    ("Queens", 40.7282, -73.7949, "#009E73"),
+    ("Bronx", 40.8448, -73.8648, "#CC79A7"),
+    ("Staten Island", 40.5795, -74.1502, "#D55E00"),
+]
+WEEKDAYS = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+MONTHS = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+]
+DAY_TO_NUM = {d: i for i, d in enumerate(WEEKDAYS)}
+MONTH_TO_NUM = {m: i + 1 for i, m in enumerate(MONTHS)}
+
+st.set_page_config(
+    page_title="NYC motor vehicle crashes",
+    page_icon=None,
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "About": f"Data source: NYC Open Data ({NYC_OPEN_DATA_URL})",
+    },
+)
+
+# Scoped layout CSS — see README UI theme; avoid global Streamlit overrides where possible.
+st.markdown(
+    """
+<style>
+  /* nyc- prefix: layout + typography helpers only; colors come from config.toml theme */
+  .nyc-page-title { font-size: 1.75rem; font-weight: 600; letter-spacing: -0.02em;
+    color: var(--text-color); margin: 0 0 0.25rem 0; }
+  .nyc-lead { font-size: 1rem; color: #64748b; line-height: 1.5; max-width: 52rem; margin: 0 0 1.25rem 0; }
+  .nyc-section-kicker { font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: #64748b; margin: 2rem 0 0.5rem 0; }
+  .nyc-method p, .nyc-method li { font-size: 0.9rem; color: #475569; line-height: 1.55; }
+  .main .block-container { padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1200px; }
+  .nyc-kicker-tight { margin-top: 0.5rem !important; }
+  .nyc-control-label { font-size: 0.65rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: #94a3b8; margin: 0 0 0.35rem 0; }
+  /* Risk tab: highlight estimate block (Streamlit widgets follow this heading in-document order) */
+  .nyc-estimate-anchor { border-left: 4px solid #0f766e; padding: 0.35rem 0 0 0.85rem; margin: 0.75rem 0 0.5rem 0; }
+  .nyc-estimate-anchor h3 { font-size: 1.05rem; font-weight: 600; margin: 0; color: #0f172a; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# Optional imports
 try:
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.model_selection import train_test_split
+    import plotly.express as px
+except ImportError:
+    px = None  # type: ignore
+
+try:
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
     from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
 
 try:
     import xgboost as xgb
+
     XGB_AVAILABLE = True
-except ImportError:
+except Exception:
     XGB_AVAILABLE = False
+    xgb = None  # type: ignore
 
 try:
     import lightgbm as lgb
+
     LGB_AVAILABLE = True
-except ImportError:
+except Exception:
     LGB_AVAILABLE = False
+    lgb = None  # type: ignore
 
 try:
     import folium
-    from folium.plugins import HeatMap, Fullscreen, MousePosition
+    from folium.plugins import Fullscreen, HeatMap, MarkerCluster, MousePosition
     import streamlit.components.v1 as components
+
     MAP_AVAILABLE = True
 except ImportError:
     MAP_AVAILABLE = False
 
-# --- Performance Settings ---
+
 @st.cache_resource
-def get_app_config():
-    """Cache application configuration for better performance"""
+def get_app_config() -> Dict[str, Any]:
     return {
-        'data_sample_size': 100000,  # Increased for better analysis
-        'cache_ttl': 3600,  # 1 hour cache
-        'map_sample_size': 10000,  # Increased for better visualization
-        'chart_height': 500,
-        'animation_enabled': True
+        "data_sample_default": 100_000,
+        "data_sample_max": 250_000,
+        "data_sample_min": 5_000,
+        "cache_ttl": 3600,
+        "map_sample_size": 10_000,
+        "risk_map_crash_max": 5_000,
+        "chart_height": 420,
     }
 
-# --- Enhanced Modern CSS ---
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    
-    .main .block-container {
-        padding-top: 1rem;
-        padding-bottom: 2rem;
-        font-family: 'Inter', sans-serif;
-        max-width: 1400px;
+
+def _plotly_layout_base(title: str, y_primary: str, y_secondary: Optional[str] = None) -> Dict[str, Any]:
+    layout: Dict[str, Any] = {
+        "title": {"text": title, "font": {"size": 16}},
+        "font": {"family": "sans-serif", "color": "#334155"},
+        "paper_bgcolor": "white",
+        "plot_bgcolor": "white",
+        "height": get_app_config()["chart_height"],
+        "margin": {"t": 48, "b": 48, "l": 56, "r": 56},
+        "xaxis": {"showgrid": True, "gridcolor": CHART["grid"], "zeroline": False},
+        "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
     }
-    
-    .dashboard-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 3rem 0;
-        margin: -1rem -1rem 2rem -1rem;
-        border-radius: 0 0 24px 24px;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
-        position: relative;
-        overflow: hidden;
+    layout["yaxis"] = {
+        "title": y_primary,
+        "showgrid": True,
+        "gridcolor": CHART["grid"],
+        "zeroline": False,
+        "tickformat": ",",
     }
-    
-    .dashboard-header::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.1'%3E%3Ccircle cx='30' cy='30' r='2'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
-        opacity: 0.3;
-    }
-    
-    .dashboard-title {
-        font-size: 3.5rem;
-        font-weight: 700;
-        color: white;
-        text-align: center;
-        margin: 0;
-        line-height: 1.1;
-        position: relative;
-        z-index: 1;
-        text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-    }
-    
-    .dashboard-subtitle {
-        font-size: 1.3rem;
-        color: rgba(255, 255, 255, 0.9);
-        text-align: center;
-        margin-top: 0.5rem;
-        font-weight: 400;
-        position: relative;
-        z-index: 1;
-    }
-    
-    .metric-container {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 1.5rem;
-        margin-bottom: 2rem;
-    }
-    
-    .metric-card {
-        background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-        padding: 2rem;
-        border-radius: 20px;
-        border: 1px solid #e2e8f0;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        text-align: center;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        position: relative;
-        overflow: hidden;
-    }
-    
-    .metric-card::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: 4px;
-        background: linear-gradient(90deg, #667eea, #764ba2);
-        transform: scaleX(0);
-        transition: transform 0.3s ease;
-    }
-    
-    .metric-card:hover {
-        transform: translateY(-8px);
-        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-        border-color: #667eea;
-    }
-    
-    .metric-card:hover::before {
-        transform: scaleX(1);
-    }
-    
-    .metric-value {
-        font-size: 3rem;
-        font-weight: 700;
-        color: #1a202c;
-        margin: 0;
-        line-height: 1;
-        background: linear-gradient(135deg, #667eea, #764ba2);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-    }
-    
-    .metric-label {
-        font-size: 0.9rem;
-        color: #718096;
-        margin-top: 0.75rem;
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-    }
-    
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        border-radius: 14px;
-        padding: 0.875rem 1.75rem;
-        font-weight: 600;
-        font-family: 'Inter', sans-serif;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        width: 100%;
-        box-shadow: 0 4px 6px -1px rgba(102, 126, 234, 0.3);
-        position: relative;
-        overflow: hidden;
-        font-size: 0.95rem;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 12px 20px -5px rgba(102, 126, 234, 0.4);
-    }
-    
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px;
-        background: #f7fafc;
-        padding: 8px;
-        border-radius: 18px;
-        border: 1px solid #e2e8f0;
-        box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.06);
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        background: transparent;
-        border-radius: 14px;
-        color: #718096;
-        font-weight: 500;
-        font-family: 'Inter', sans-serif;
-        border: none;
-        padding: 14px 24px;
-        transition: all 0.2s ease;
-        font-size: 0.95rem;
-    }
-    
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, #667eea, #764ba2) !important;
-        color: white !important;
-        box-shadow: 0 4px 6px -1px rgba(102, 126, 234, 0.3);
-        transform: translateY(-1px);
-    }
-    
-    .chart-container {
-        background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-        border-radius: 20px;
-        padding: 1.5rem;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        border: 1px solid #e2e8f0;
-        margin-bottom: 1.5rem;
-        transition: all 0.3s ease;
-    }
-    
-    .chart-container:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 25px -5px rgba(0, 0, 0, 0.1);
-    }
-    
-    .info-box {
-        background: linear-gradient(135deg, #dbeafe 0%, #eff6ff 100%);
-        border: 1px solid #3b82f6;
-        border-radius: 16px;
-        padding: 1.25rem;
-        margin: 1rem 0;
-        box-shadow: 0 2px 4px rgba(59, 130, 246, 0.1);
-    }
-    
-    .warning-box {
-        background: linear-gradient(135deg, #fef3cd 0%, #fffbeb 100%);
-        border: 1px solid #f59e0b;
-        border-radius: 16px;
-        padding: 1.25rem;
-        margin: 1rem 0;
-        box-shadow: 0 2px 4px rgba(245, 158, 11, 0.1);
-    }
-    
-    .success-box {
-        background: linear-gradient(135deg, #dcfce7 0%, #f0fdf4 100%);
-        border: 1px solid #22c55e;
-        border-radius: 16px;
-        padding: 1.25rem;
-        margin: 1rem 0;
-        box-shadow: 0 2px 4px rgba(34, 197, 94, 0.1);
-    }
-    
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .stDeployButton {display: none;}
-    
-    @media (max-width: 768px) {
-        .dashboard-title {
-            font-size: 2.5rem;
+    if y_secondary:
+        layout["yaxis2"] = {
+            "title": y_secondary,
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "tickformat": ".0%",
+            "range": [0, 1],
         }
-        .metric-container {
-            grid-template-columns: 1fr;
-        }
+    return layout
+
+
+def _normalize_collision_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    renames = {}
+    if "CRASH DATE" in df.columns and "CRASH_DATE" not in df.columns:
+        renames["CRASH DATE"] = "CRASH_DATE"
+    if "CRASH TIME" in df.columns and "CRASH_TIME" not in df.columns:
+        renames["CRASH TIME"] = "CRASH_TIME"
+    if renames:
+        df = df.rename(columns=renames)
+    return df
+
+
+def _preprocess_collision_df(df: pd.DataFrame) -> pd.DataFrame:
+    df["CRASH_DATE"] = pd.to_datetime(df["CRASH_DATE"], errors="coerce")
+    time_str = df["CRASH_TIME"].astype(str).str.strip()
+    crash_dt = pd.to_datetime(
+        df["CRASH_DATE"].dt.strftime("%Y-%m-%d") + " " + time_str,
+        errors="coerce",
+    )
+    df["hour"] = crash_dt.dt.hour
+    df["year"] = df["CRASH_DATE"].dt.year
+    df["month"] = df["CRASH_DATE"].dt.month
+    df["day_of_week"] = df["CRASH_DATE"].dt.dayofweek
+    df["day_name"] = df["CRASH_DATE"].dt.day_name()
+    df["month_name"] = df["CRASH_DATE"].dt.month_name()
+    df["quarter"] = df["CRASH_DATE"].dt.quarter
+    df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+    df["is_rush_hour"] = (
+        (df["hour"].between(7, 9)) | (df["hour"].between(17, 19))
+    ).astype(int)
+    df["is_night"] = ((df["hour"] >= 22) | (df["hour"] <= 5)).astype(int)
+    df["is_holiday_season"] = df["month"].isin([11, 12, 1]).astype(int)
+
+    injury_cols = [c for c in df.columns if "INJURED" in c]
+    killed_cols = [c for c in df.columns if "KILLED" in c]
+    df["total_injured"] = df[injury_cols].sum(axis=1, skipna=True)
+    df["total_killed"] = df[killed_cols].sum(axis=1, skipna=True)
+    df["total_casualties"] = df["total_injured"] + df["total_killed"]
+    df["is_serious"] = ((df["total_killed"] > 0) | (df["total_injured"] >= 2)).astype(int)
+    df["severity_level"] = pd.cut(
+        df["total_casualties"],
+        bins=[-1, 0, 1, 3, float("inf")],
+        labels=["No Injury", "Minor", "Moderate", "Severe"],
+    )
+    df["risk_score"] = (
+        df["total_killed"] * 10
+        + df["total_injured"] * 3
+        + df["is_rush_hour"] * 2
+        + df["is_night"] * 1.5
+        + df["is_weekend"] * 1.2
+        + df["is_holiday_season"] * 1.3
+    )
+
+    if "LATITUDE" in df.columns and "LONGITUDE" in df.columns:
+        df["LATITUDE"] = pd.to_numeric(df["LATITUDE"], errors="coerce")
+        df["LONGITUDE"] = pd.to_numeric(df["LONGITUDE"], errors="coerce")
+
+        def borough(lat: float, lon: float) -> str:
+            if pd.isna(lat) or pd.isna(lon):
+                return "Unknown"
+            if 40.7 <= lat <= 40.83 and -74.02 <= lon <= -73.91:
+                return "Manhattan"
+            if 40.57 <= lat <= 40.74 and -74.05 <= lon <= -73.83:
+                return "Brooklyn"
+            if 40.67 <= lat <= 40.81 and -73.96 <= lon <= -73.70:
+                return "Queens"
+            if 40.79 <= lat <= 40.92 and -73.93 <= lon <= -73.77:
+                return "Bronx"
+            if 40.49 <= lat <= 40.65 and -74.26 <= lon <= -74.05:
+                return "Staten Island"
+            return "Other NYC Area"
+
+        df["borough"] = df.apply(lambda r: borough(r["LATITUDE"], r["LONGITUDE"]), axis=1)
+
+    return df.dropna(subset=["CRASH_DATE", "hour"])
+
+
+@st.cache_data(ttl=get_app_config()["cache_ttl"], show_spinner=False)
+def load_collision_data(sample_size: Optional[int], path: str, file_mtime: float) -> Dict[str, Any]:
+    """
+    Load CSV; cache invalidates when file_mtime changes (replace CSV → auto-refresh).
+    No Streamlit UI calls inside (cache-safe).
+    """
+    out: Dict[str, Any] = {
+        "df": pd.DataFrame(),
+        "error": None,
+        "rows_read": 0,
+        "rows_after_clean": 0,
     }
-</style>
-""", unsafe_allow_html=True)
-
-# --- Constants ---
-NYC_BOROUGHS = {
-    'Manhattan': [40.7589, -73.9851, '#FF6B6B'],
-    'Brooklyn': [40.6782, -73.9442, '#4ECDC4'],
-    'Queens': [40.7282, -73.7949, '#45B7D1'],
-    'Bronx': [40.8448, -73.8648, '#96CEB4'],
-    'Staten Island': [40.5795, -74.1502, '#FFEAA7']
-}
-
-# Initialize session state
-if 'selected_lat' not in st.session_state:
-    st.session_state.selected_lat = 40.7128
-if 'selected_lon' not in st.session_state:
-    st.session_state.selected_lon = -74.0060
-
-# --- Enhanced Data Loading with Caching ---
-@st.cache_data(ttl=get_app_config()['cache_ttl'])
-def load_data(sample_size: Optional[int] = None) -> pd.DataFrame:
-    """Load and preprocess collision data with enhanced caching"""
     try:
-        # Try to load the data
-        if os.path.exists('Motor_Vehicle_Collisions_-_Crashes.csv'):
-            df = pd.read_csv('Motor_Vehicle_Collisions_-_Crashes.csv')
-        else:
-            st.error("Data file not found. Please upload 'Motor_Vehicle_Collisions_-_Crashes.csv'")
-            return pd.DataFrame()
-        
-        # Sample data for performance if needed
+        if not os.path.isfile(path):
+            out["error"] = "missing_file"
+            return out
+        df = pd.read_csv(path)
+        out["rows_read"] = len(df)
+        df = _normalize_collision_df_columns(df)
+        if "CRASH_DATE" not in df.columns or "CRASH_TIME" not in df.columns:
+            out["error"] = "schema"
+            return out
         if sample_size and len(df) > sample_size:
             df = df.sample(n=sample_size, random_state=42)
-        
-        # Enhanced preprocessing
-        df['CRASH_DATE'] = pd.to_datetime(df['CRASH_DATE'], errors='coerce')
-        df['CRASH_TIME'] = pd.to_datetime(df['CRASH_TIME'], format='%H:%M', errors='coerce')
-        
-        # Extract enhanced time features
-        df['year'] = df['CRASH_DATE'].dt.year
-        df['month'] = df['CRASH_DATE'].dt.month
-        df['day_of_week'] = df['CRASH_DATE'].dt.dayofweek
-        df['hour'] = df['CRASH_TIME'].dt.hour
-        df['day_name'] = df['CRASH_DATE'].dt.day_name()
-        df['month_name'] = df['CRASH_DATE'].dt.month_name()
-        df['quarter'] = df['CRASH_DATE'].dt.quarter
-        
-        # Enhanced binary features
-        df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-        df['is_rush_hour'] = ((df['hour'].between(7, 9)) | (df['hour'].between(17, 19))).astype(int)
-        df['is_night'] = ((df['hour'] >= 22) | (df['hour'] <= 5)).astype(int)
-        df['is_holiday_season'] = df['month'].isin([11, 12, 1]).astype(int)
-        
-        # Calculate casualties with enhanced logic
-        injury_cols = [col for col in df.columns if 'INJURED' in col]
-        killed_cols = [col for col in df.columns if 'KILLED' in col]
-        
-        df['total_injured'] = df[injury_cols].sum(axis=1, skipna=True)
-        df['total_killed'] = df[killed_cols].sum(axis=1, skipna=True)
-        df['total_casualties'] = df['total_injured'] + df['total_killed']
-        
-        # Enhanced severity classification
-        df['is_serious'] = ((df['total_killed'] > 0) | (df['total_injured'] >= 2)).astype(int)
-        df['severity_level'] = pd.cut(
-            df['total_casualties'], 
-            bins=[-1, 0, 1, 3, float('inf')], 
-            labels=['No Injury', 'Minor', 'Moderate', 'Severe']
-        )
-        
-        # Enhanced risk scoring
-        df['risk_score'] = (
-            df['total_killed'] * 10 + 
-            df['total_injured'] * 3 + 
-            df['is_rush_hour'] * 2 + 
-            df['is_night'] * 1.5 + 
-            df['is_weekend'] * 1.2 +
-            df['is_holiday_season'] * 1.3
-        )
-        
-        # Location processing
-        if 'LATITUDE' in df.columns and 'LONGITUDE' in df.columns:
-            df['LATITUDE'] = pd.to_numeric(df['LATITUDE'], errors='coerce')
-            df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
-            
-            # Enhanced borough classification
-            def get_borough_enhanced(lat, lon):
-                if pd.isna(lat) or pd.isna(lon):
-                    return 'Unknown'
-                # More precise borough boundaries
-                if 40.7 <= lat <= 40.83 and -74.02 <= lon <= -73.91:
-                    return 'Manhattan'
-                elif 40.57 <= lat <= 40.74 and -74.05 <= lon <= -73.83:
-                    return 'Brooklyn'
-                elif 40.67 <= lat <= 40.81 and -73.96 <= lon <= -73.70:
-                    return 'Queens'
-                elif 40.79 <= lat <= 40.92 and -73.93 <= lon <= -73.77:
-                    return 'Bronx'
-                elif 40.49 <= lat <= 40.65 and -74.26 <= lon <= -74.05:
-                    return 'Staten Island'
-                else:
-                    return 'Other NYC Area'
-            
-            df['borough'] = df.apply(lambda x: get_borough_enhanced(x['LATITUDE'], x['LONGITUDE']), axis=1)
-        
-        # Remove rows with missing critical data
-        df = df.dropna(subset=['CRASH_DATE', 'hour'])
-        
-        return df
-        
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        return pd.DataFrame()
+        df = _preprocess_collision_df(df)
+        out["df"] = df
+        out["rows_after_clean"] = len(df)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"load_failed:{exc}"
+    return out
 
-# --- Enhanced ML Model Training ---
+
+def apply_view_filters(
+    data: pd.DataFrame,
+    year_lo: int,
+    year_hi: int,
+    boroughs: List[str],
+    severity: str,
+) -> pd.DataFrame:
+    v = data[(data["year"] >= year_lo) & (data["year"] <= year_hi)]
+    if boroughs and "borough" in v.columns:
+        v = v[v["borough"].isin(boroughs)]
+    if severity == "Serious only":
+        v = v[v["is_serious"] == 1]
+    elif severity == "Non-serious only":
+        v = v[v["is_serious"] == 0]
+    return v
+
+
 @st.cache_resource
-def train_enhanced_models(data: pd.DataFrame) -> Dict[str, Any]:
-    """Train multiple ML models with enhanced performance"""
+def train_models(data: pd.DataFrame) -> Dict[str, Any]:
     if not ML_AVAILABLE or data.empty:
         return {}
-    
     try:
-        # Prepare features
-        feature_cols = ['hour', 'day_of_week', 'month', 'is_weekend', 'is_rush_hour', 'is_night', 'is_holiday_season']
-        if 'LATITUDE' in data.columns and 'LONGITUDE' in data.columns:
-            feature_cols.extend(['LATITUDE', 'LONGITUDE'])
-        
-        # Clean data
-        ml_data = data[feature_cols + ['is_serious']].dropna()
+        feature_cols = [
+            "hour",
+            "day_of_week",
+            "month",
+            "is_weekend",
+            "is_rush_hour",
+            "is_night",
+            "is_holiday_season",
+        ]
+        if "LATITUDE" in data.columns and "LONGITUDE" in data.columns:
+            feature_cols.extend(["LATITUDE", "LONGITUDE"])
+        ml_data = data[feature_cols + ["is_serious"]].dropna()
         if len(ml_data) < 1000:
             return {}
-        
         X = ml_data[feature_cols].astype(np.float32)
-        y = ml_data['is_serious'].astype(np.int8)
-        
-        # Split data
+        y = ml_data["is_serious"].astype(np.int8)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
-        
-        models = {}
-        
-        # Random Forest with optimized parameters
-        rf_model = RandomForestClassifier(
+        models: Dict[str, Any] = {}
+        rf = RandomForestClassifier(
             n_estimators=150,
             max_depth=15,
             min_samples_split=10,
             min_samples_leaf=5,
             random_state=42,
             n_jobs=-1,
-            class_weight='balanced'
+            class_weight="balanced",
         )
-        rf_model.fit(X_train, y_train)
-        rf_score = roc_auc_score(y_test, rf_model.predict_proba(X_test)[:, 1])
-        models['Random Forest'] = {'model': rf_model, 'score': rf_score}
-        
-        # Gradient Boosting
-        gb_model = GradientBoostingClassifier(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=8,
-            random_state=42
+        rf.fit(X_train, y_train)
+        models["Random Forest"] = {"model": rf, "score": roc_auc_score(y_test, rf.predict_proba(X_test)[:, 1])}
+        gb = GradientBoostingClassifier(
+            n_estimators=100, learning_rate=0.1, max_depth=8, random_state=42
         )
-        gb_model.fit(X_train, y_train)
-        gb_score = roc_auc_score(y_test, gb_model.predict_proba(X_test)[:, 1])
-        models['Gradient Boosting'] = {'model': gb_model, 'score': gb_score}
-        
-        # XGBoost if available
-        if XGB_AVAILABLE:
-            xgb_model = xgb.XGBClassifier(
+        gb.fit(X_train, y_train)
+        models["Gradient Boosting"] = {
+            "model": gb,
+            "score": roc_auc_score(y_test, gb.predict_proba(X_test)[:, 1]),
+        }
+        if XGB_AVAILABLE and xgb is not None:
+            xm = xgb.XGBClassifier(
                 n_estimators=100,
                 max_depth=8,
                 learning_rate=0.1,
                 random_state=42,
                 n_jobs=-1,
-                eval_metric='logloss'
+                eval_metric="logloss",
             )
-            xgb_model.fit(X_train, y_train)
-            xgb_score = roc_auc_score(y_test, xgb_model.predict_proba(X_test)[:, 1])
-            models['XGBoost'] = {'model': xgb_model, 'score': xgb_score}
-        
-        # LightGBM if available
-        if LGB_AVAILABLE:
-            lgb_model = lgb.LGBMClassifier(
+            xm.fit(X_train, y_train)
+            models["XGBoost"] = {"model": xm, "score": roc_auc_score(y_test, xm.predict_proba(X_test)[:, 1])}
+        if LGB_AVAILABLE and lgb is not None:
+            lm = lgb.LGBMClassifier(
                 n_estimators=100,
                 max_depth=8,
                 learning_rate=0.1,
                 random_state=42,
                 n_jobs=-1,
-                verbosity=-1
+                verbosity=-1,
             )
-            lgb_model.fit(X_train, y_train)
-            lgb_score = roc_auc_score(y_test, lgb_model.predict_proba(X_test)[:, 1])
-            models['LightGBM'] = {'model': lgb_model, 'score': lgb_score}
-        
-        # Select best model
-        best_model_name = max(models.keys(), key=lambda k: models[k]['score'])
-        best_model = models[best_model_name]['model']
-        
+            lm.fit(X_train, y_train)
+            models["LightGBM"] = {"model": lm, "score": roc_auc_score(y_test, lm.predict_proba(X_test)[:, 1])}
+        best = max(models.keys(), key=lambda k: models[k]["score"])
         return {
-            'models': models,
-            'best_model': best_model,
-            'best_model_name': best_model_name,
-            'feature_names': feature_cols,
-            'X_test': X_test,
-            'y_test': y_test
+            "models": models,
+            "best_model": models[best]["model"],
+            "best_model_name": best,
+            "feature_names": feature_cols,
         }
-        
-    except Exception as e:
-        st.error(f"Error training models: {str(e)}")
-        return {}
+    except Exception as exc:  # noqa: BLE001
+        return {"_train_error": str(exc)}
 
-# --- Enhanced Prediction Interface ---
-def create_enhanced_prediction_interface(model_info: Dict[str, Any]) -> None:
-    """Create an enhanced prediction interface with interactive features"""
-    st.subheader("🎯 AI-Powered Risk Prediction")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.markdown("### 📍 Location Selection")
-        
-        if MAP_AVAILABLE:
-            # Interactive map
-            m = folium.Map(
-                location=[st.session_state.selected_lat, st.session_state.selected_lon],
-                zoom_start=11,
-                tiles='CartoDB positron'
-            )
-            
-            # Add borough boundaries and markers
-            for name, (lat, lon, color) in NYC_BOROUGHS.items():
-                folium.CircleMarker(
-                    [lat, lon],
-                    radius=8,
-                    popup=f"{name}",
-                    color=color,
-                    fill=True,
-                    fillColor=color,
-                    fillOpacity=0.7,
-                    weight=2
-                ).add_to(m)
-            
-            # Add selected location marker
-            folium.Marker(
-                [st.session_state.selected_lat, st.session_state.selected_lon],
-                popup="Selected Location",
-                icon=folium.Icon(color='red', icon='info-sign')
-            ).add_to(m)
-            
-            # Add plugins
-            Fullscreen().add_to(m)
-            MousePosition().add_to(m)
-            
-            # Display map
-            map_html = m._repr_html_()
-            components.html(map_html, height=400)
-            
-            # Location inputs
-            col_lat, col_lon = st.columns(2)
-            with col_lat:
-                new_lat = st.number_input(
-                    "Latitude", 
-                    value=st.session_state.selected_lat, 
-                    format="%.4f",
-                    step=0.0001
-                )
-            with col_lon:
-                new_lon = st.number_input(
-                    "Longitude", 
-                    value=st.session_state.selected_lon, 
-                    format="%.4f",
-                    step=0.0001
-                )
-            
-            if new_lat != st.session_state.selected_lat or new_lon != st.session_state.selected_lon:
-                st.session_state.selected_lat = new_lat
-                st.session_state.selected_lon = new_lon
-                st.rerun()
-            
-            # Quick presets
-            st.markdown("**Quick Location Presets:**")
-            preset_cols = st.columns(3)
-            for i, (name, coords) in enumerate(list(NYC_BOROUGHS.items())[:3]):
-                with preset_cols[i]:
-                    if st.button(name, key=f"preset_{i}", use_container_width=True):
-                        st.session_state.selected_lat = coords[0]
-                        st.session_state.selected_lon = coords[1]
-                        st.rerun()
-        
-        else:
-            st.warning("Map visualization not available. Using coordinate inputs.")
-            st.session_state.selected_lat = st.number_input("Latitude", value=40.7128, format="%.4f")
-            st.session_state.selected_lon = st.number_input("Longitude", value=-74.0060, format="%.4f")
-    
-    with col2:
-        st.markdown("### ⏰ Time & Conditions")
-        
-        # Time inputs
-        selected_hour = st.slider("Hour of Day", 0, 23, 12)
-        selected_day = st.selectbox(
-            "Day of Week",
-            ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        )
-        selected_month = st.selectbox(
-            "Month",
-            ['January', 'February', 'March', 'April', 'May', 'June',
-             'July', 'August', 'September', 'October', 'November', 'December']
-        )
-        
-        # Convert to numeric
-        day_mapping = {
-            'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3,
-            'Friday': 4, 'Saturday': 5, 'Sunday': 6
-        }
-        month_mapping = {
-            'January': 1, 'February': 2, 'March': 3, 'April': 4,
-            'May': 5, 'June': 6, 'July': 7, 'August': 8,
-            'September': 9, 'October': 10, 'November': 11, 'December': 12
-        }
-        
-        day_num = day_mapping[selected_day]
-        month_num = month_mapping[selected_month]
-        
-        # Calculate derived features
-        is_weekend = 1 if day_num in [5, 6] else 0
-        is_rush_hour = 1 if (7 <= selected_hour <= 9) or (17 <= selected_hour <= 19) else 0
-        is_night = 1 if selected_hour >= 22 or selected_hour <= 5 else 0
-        is_holiday_season = 1 if month_num in [11, 12, 1] else 0
-        
-        # Display condition indicators
-        st.markdown("**Conditions:**")
-        conditions = []
-        if is_weekend:
-            conditions.append("🏠 Weekend")
-        if is_rush_hour:
-            conditions.append("🚗 Rush Hour")
-        if is_night:
-            conditions.append("🌙 Night Time")
-        if is_holiday_season:
-            conditions.append("🎄 Holiday Season")
-        
-        if conditions:
-            for condition in conditions:
-                st.markdown(f"- {condition}")
-        else:
-            st.markdown("- ✅ Normal Conditions")
-    
-    # Make prediction if model is available
-    if model_info and 'best_model' in model_info:
-        st.markdown("---")
-        
-        # Prepare features
-        features = [
-            selected_hour, day_num, month_num, is_weekend, 
-            is_rush_hour, is_night, is_holiday_season
-        ]
-        
-        # Add coordinates if available in model
-        if 'LATITUDE' in model_info['feature_names']:
-            features.extend([st.session_state.selected_lat, st.session_state.selected_lon])
-        
-        # Make prediction
-        try:
-            model = model_info['best_model']
-            prediction_proba = model.predict_proba([features])[0]
-            risk_probability = prediction_proba[1]
-            
-            # Display results
-            st.markdown("### 🎯 Risk Assessment Results")
-            
-            # Risk level
-            if risk_probability >= 0.7:
-                risk_level = "HIGH RISK"
-                risk_color = "🔴"
-                advice = "Exercise extreme caution. Consider avoiding this time/location if possible."
-            elif risk_probability >= 0.4:
-                risk_level = "MODERATE RISK"
-                risk_color = "🟡"
-                advice = "Be extra cautious and follow all traffic safety measures."
-            else:
-                risk_level = "LOW RISK"
-                risk_color = "🟢"
-                advice = "Normal safety precautions recommended."
-            
-            # Results display
-            col_prob, col_level = st.columns(2)
-            with col_prob:
-                st.metric(
-                    "Risk Probability",
-                    f"{risk_probability:.1%}",
-                    delta=f"{risk_probability - 0.5:.1%} vs baseline"
-                )
-            with col_level:
-                st.metric("Risk Level", f"{risk_color} {risk_level}")
-            
-            # Progress bar
-            st.progress(risk_probability)
-            
-            # Advice
-            if risk_probability >= 0.4:
-                st.warning(f"⚠️ {advice}")
-            else:
-                st.success(f"✅ {advice}")
-            
-            # Model information
-            with st.expander("🤖 Model Details"):
-                st.write(f"**Model Used:** {model_info['best_model_name']}")
-                if 'models' in model_info:
-                    st.write("**Model Performance (AUC Scores):**")
-                    for name, info in model_info['models'].items():
-                        st.write(f"- {name}: {info['score']:.3f}")
-        
-        except Exception as e:
-            st.error(f"Error making prediction: {str(e)}")
-    
-    else:
-        st.info("🤖 ML models not available. Please check data and dependencies.")
 
-# --- Enhanced Visualizations ---
-def create_enhanced_time_analysis(data: pd.DataFrame) -> None:
-    """Create enhanced time-based analysis with multiple charts"""
-    st.subheader("📊 Temporal Analysis")
-    
-    config = get_app_config()
-    
-    # Hourly pattern
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### Accidents by Hour")
-        hourly_data = data.groupby('hour').agg({
-            'is_serious': ['count', 'mean']
-        }).round(3)
-        hourly_data.columns = ['Total', 'Serious_Rate']
-        hourly_data = hourly_data.reset_index()
-        
-        fig = make_subplots(
-            specs=[[{"secondary_y": True}]],
-            subplot_titles=("Accident Volume vs Severity Rate",)
-        )
-        
-        fig.add_trace(
-            go.Bar(x=hourly_data['hour'], y=hourly_data['Total'], 
-                   name="Total Accidents", opacity=0.7, marker_color='#667eea'),
-            secondary_y=False,
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=hourly_data['hour'], y=hourly_data['Serious_Rate'], 
-                      mode='lines+markers', name="Serious Rate", 
-                      line=dict(color='#764ba2', width=3)),
-            secondary_y=True,
-        )
-        
-        fig.update_xaxes(title_text="Hour of Day")
-        fig.update_yaxes(title_text="Number of Accidents", secondary_y=False)
-        fig.update_yaxes(title_text="Serious Accident Rate", secondary_y=True)
-        fig.update_layout(height=config['chart_height'], showlegend=True)
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.markdown("#### Weekly Patterns")
-        daily_data = data.groupby(['day_name', 'day_of_week']).size().reset_index(name='count')
-        daily_data = daily_data.sort_values('day_of_week')
-        
-        fig = px.bar(
-            daily_data, x='day_name', y='count',
-            title="Accidents by Day of Week",
-            color='count',
-            color_continuous_scale='Viridis'
-        )
-        fig.update_layout(height=config['chart_height'])
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Monthly trends
-    st.markdown("#### Monthly and Seasonal Trends")
-    col3, col4 = st.columns(2)
-    
-    with col3:
-        monthly_data = data.groupby(['month', 'month_name']).size().reset_index(name='count')
-        monthly_data = monthly_data.sort_values('month')
-        
-        fig = px.line(
-            monthly_data, x='month_name', y='count',
-            title="Monthly Accident Trends",
-            markers=True
-        )
-        fig.update_xaxes(tickangle=45)
-        fig.update_layout(height=config['chart_height'])
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col4:
-        # Severity by conditions
-        condition_data = data.groupby(['is_weekend', 'is_rush_hour', 'is_night'])['is_serious'].mean().reset_index()
-        condition_data['condition'] = condition_data.apply(lambda x: 
-            f"{'Weekend' if x['is_weekend'] else 'Weekday'}, " +
-            f"{'Rush' if x['is_rush_hour'] else 'Non-Rush'}, " +
-            f"{'Night' if x['is_night'] else 'Day'}", axis=1)
-        
-        fig = px.bar(
-            condition_data, x='condition', y='is_serious',
-            title="Serious Accident Rate by Conditions",
-            color='is_serious',
-            color_continuous_scale='Reds'
-        )
-        fig.update_xaxes(tickangle=45)
-        fig.update_layout(height=config['chart_height'])
-        st.plotly_chart(fig, use_container_width=True)
+def render_methodology_block(path: str, pack: Dict[str, Any]) -> None:
+    stat = os.stat(path) if os.path.isfile(path) else None
+    modified = (
+        datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M local")
+        if stat
+        else "—"
+    )
+    size_mb = f"{stat.st_size / (1024**2):.1f} MB" if stat else "—"
 
-def create_enhanced_geographic_analysis(data: pd.DataFrame) -> None:
-    """Create enhanced geographic analysis with heatmaps and statistics"""
-    st.subheader("🗺️ Geographic Analysis")
-    
-    config = get_app_config()
-    
+    st.markdown('<p class="nyc-section-kicker">Notes</p>', unsafe_allow_html=True)
+    with st.expander("Where the data comes from and what we changed", expanded=False):
+        st.markdown(
+            f"""
+<div class="nyc-method">
+<p>This app reads NYC’s published motor-vehicle crash file and builds charts and a simple classifier on top.
+Use the filters above, then open each tab for the risk model, time charts, a heat map, or a CSV download.</p>
+<ul>
+<li><strong>Dataset:</strong> <a href="{NYC_OPEN_DATA_URL}" target="_blank" rel="noopener">Motor Vehicle Collisions — Crashes</a> on NYC Open Data.</li>
+<li><strong>Local file:</strong> <code>{path}</code> · modified <strong>{modified}</strong> · size about <strong>{size_mb}</strong>.</li>
+<li><strong>Rows:</strong> {pack.get("rows_read", 0):,} read from the file; {pack.get("rows_after_clean", 0):,} kept after dropping rows without a valid date or hour.</li>
+<li><strong>Row cap:</strong> If you set a max below the file size, we take a random sample (always seed 42) before cleaning.</li>
+<li><strong>Serious crashes:</strong> We label a row serious if someone died or at least two people were injured — that’s what the model predicts.</li>
+<li><strong>Risk score (heat map):</strong> A homemade index from injuries, deaths, and time of day. It isn’t from the city.</li>
+<li><strong>Map tab:</strong> At most {get_app_config()["map_sample_size"]:,} points with coordinates, for speed.</li>
+<li><strong>Risk tab map:</strong> Up to {get_app_config()["risk_map_crash_max"]:,} points from your current filters, clustered. Amber = serious label, gray = not.</li>
+<li><strong>Model:</strong> Trained on the loaded sample; we report ROC AUC on a 20% holdout set. Useful for exploration, not for policy or engineering decisions.</li>
+</ul>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+
+def _prepare_collisions_for_risk_map(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
+    """Rows with coordinates; random sample if over max_points (seed 42)."""
+    if df.empty or "LATITUDE" not in df.columns or "LONGITUDE" not in df.columns:
+        return pd.DataFrame()
+    pts = df.dropna(subset=["LATITUDE", "LONGITUDE"])
+    if pts.empty:
+        return pts
+    if len(pts) > max_points:
+        pts = pts.sample(n=max_points, random_state=42)
+    return pts
+
+
+def _folium_risk_map(
+    lat: float,
+    lon: float,
+    height: int = 300,
+    collisions: Optional[pd.DataFrame] = None,
+) -> Optional[str]:
+    """Folium map: borough refs, clustered crash points (filtered sample), then your input pin.
+    Returns optional markdown caption about the crash sample (caller should render with st.caption).
+    """
     if not MAP_AVAILABLE:
-        st.warning("Map visualization not available")
-        return
-    
-    # Borough analysis
-    if 'borough' in data.columns:
-        st.markdown("#### Borough Comparison")
-        borough_stats = data.groupby('borough').agg({
-            'is_serious': ['count', 'mean', 'sum'],
-            'risk_score': 'mean'
-        }).round(3)
-        
-        borough_stats.columns = ['Total_Accidents', 'Serious_Rate', 'Serious_Count', 'Avg_Risk_Score']
-        borough_stats = borough_stats.reset_index().sort_values('Total_Accidents', ascending=False)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.bar(
-                borough_stats, x='borough', y='Total_Accidents',
-                title="Total Accidents by Borough",
-                color='Total_Accidents',
-                color_continuous_scale='Blues'
-            )
-            fig.update_layout(height=config['chart_height'])
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.bar(
-                borough_stats, x='borough', y='Serious_Rate',
-                title="Serious Accident Rate by Borough",
-                color='Serious_Rate',
-                color_continuous_scale='Reds'
-            )
-            fig.update_layout(height=config['chart_height'])
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Interactive heatmap
-    st.markdown("#### Risk Heatmap")
-    
-    # Sample data for heatmap performance
-    map_data = data.dropna(subset=['LATITUDE', 'LONGITUDE'])
-    if len(map_data) > config['map_sample_size']:
-        map_data = map_data.sample(n=config['map_sample_size'], random_state=42)
-    
-    if len(map_data) > 0:
-        # Create heatmap
-        m = folium.Map(location=[40.7128, -74.0060], zoom_start=10, tiles='CartoDB positron')
-        
-        # Add heatmap layer
-        heat_data = [[row['LATITUDE'], row['LONGITUDE'], row['risk_score']] 
-                     for idx, row in map_data.iterrows() 
-                     if pd.notna(row['LATITUDE']) and pd.notna(row['LONGITUDE'])]
-        
-        if heat_data:
-            HeatMap(heat_data, radius=15, max_zoom=13).add_to(m)
-        
-        # Add borough markers
-        for name, (lat, lon, color) in NYC_BOROUGHS.items():
-            folium.CircleMarker(
-                [lat, lon],
-                radius=10,
-                popup=f"{name}",
-                color=color,
-                fill=True,
-                fillColor=color,
-                fillOpacity=0.7,
-                weight=3
-            ).add_to(m)
-        
-        # Add plugins
-        Fullscreen().add_to(m)
-        
-        # Display map
-        map_html = m._repr_html_()
-        components.html(map_html, height=500)
-        
-        st.info("🔥 Heatmap shows risk intensity across NYC. Darker areas indicate higher risk.")
+        return None
+    cfg = get_app_config()
+    max_c = cfg["risk_map_crash_max"]
 
-def create_enhanced_data_explorer(data: pd.DataFrame) -> None:
-    """Create an enhanced data exploration interface"""
-    st.subheader("🔍 Data Explorer")
-    
-    # Data overview
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Total Records", f"{len(data):,}")
-    with col2:
-        st.metric("Date Range", f"{(data['CRASH_DATE'].max() - data['CRASH_DATE'].min()).days} days")
-    with col3:
-        st.metric("Unique Locations", f"{data[['LATITUDE', 'LONGITUDE']].dropna().drop_duplicates().shape[0]:,}")
-    
-    # Interactive filters
-    st.markdown("#### Interactive Filters")
-    
-    col_filter1, col_filter2, col_filter3 = st.columns(3)
-    
-    with col_filter1:
-        year_range = st.slider(
-            "Year Range",
-            min_value=int(data['year'].min()),
-            max_value=int(data['year'].max()),
-            value=(int(data['year'].min()), int(data['year'].max()))
-        )
-    
-    with col_filter2:
-        selected_boroughs = st.multiselect(
-            "Boroughs",
-            options=data['borough'].unique() if 'borough' in data.columns else [],
-            default=data['borough'].unique() if 'borough' in data.columns else []
-        )
-    
-    with col_filter3:
-        severity_filter = st.selectbox(
-            "Severity Level",
-            options=['All', 'Serious Only', 'Minor Only'],
-            index=0
-        )
-    
-    # Apply filters
-    filtered_data = data[
-        (data['year'] >= year_range[0]) & 
-        (data['year'] <= year_range[1])
-    ]
-    
-    if selected_boroughs and 'borough' in data.columns:
-        filtered_data = filtered_data[filtered_data['borough'].isin(selected_boroughs)]
-    
-    if severity_filter == 'Serious Only':
-        filtered_data = filtered_data[filtered_data['is_serious'] == 1]
-    elif severity_filter == 'Minor Only':
-        filtered_data = filtered_data[filtered_data['is_serious'] == 0]
-    
-    # Display filtered statistics
-    st.markdown(f"#### Filtered Data ({len(filtered_data):,} records)")
-    
-    col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
-    
-    with col_stat1:
-        st.metric("Injuries", f"{filtered_data['total_injured'].sum():,}")
-    with col_stat2:
-        st.metric("Fatalities", f"{filtered_data['total_killed'].sum():,}")
-    with col_stat3:
-        st.metric("Serious Rate", f"{filtered_data['is_serious'].mean():.1%}")
-    with col_stat4:
-        st.metric("Avg Risk Score", f"{filtered_data['risk_score'].mean():.1f}")
-    
-    # Sample data table
-    if st.checkbox("Show Sample Data"):
-        st.dataframe(
-            filtered_data.head(1000)[['CRASH_DATE', 'CRASH_TIME', 'borough', 'total_injured', 
-                                     'total_killed', 'is_serious', 'risk_score']],
-            height=300
-        )
+    m = folium.Map(location=[lat, lon], zoom_start=11, tiles="CartoDB positron")
+    for name, plat, plon, color in BOROUGH_MAP_STYLE:
+        folium.CircleMarker(
+            [plat, plon],
+            radius=5,
+            popup=name,
+            tooltip=name,
+            color=color,
+            fill=True,
+            fillColor=color,
+            fillOpacity=0.55,
+            weight=2,
+        ).add_to(m)
 
-# --- Main Application ---
-def main():
-    """Main application function with enhanced features"""
-    
-    # Header
-    st.markdown("""
-    <div class="dashboard-header">
-        <h1 class="dashboard-title">NYC Collisions AI Dashboard</h1>
-        <p class="dashboard-subtitle">Advanced Machine Learning Analytics for Traffic Safety</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Load data
-    config = get_app_config()
-    
-    with st.spinner("🔄 Loading and processing data..."):
-        data = load_data(sample_size=config['data_sample_size'])
-    
-    if data.empty:
-        st.error("❌ No data available. Please check the data file.")
+    total_geo = 0
+    if collisions is not None and not collisions.empty:
+        total_geo = int(collisions.dropna(subset=["LATITUDE", "LONGITUDE"]).shape[0])
+        pts = _prepare_collisions_for_risk_map(collisions, max_c)
+        if not pts.empty:
+            crash_group = folium.FeatureGroup(name="Crashes (your filters)", show=True)
+            cluster = MarkerCluster(max_cluster_radius=50).add_to(crash_group)
+            for _, r in pts.iterrows():
+                serious = int(r.get("is_serious", 0) or 0) == 1
+                col = CHART["serious_line"] if serious else CHART["neutral"]
+                pop_parts = [
+                    "<b>Crash</b>",
+                    f"Serious: {'yes' if serious else 'no'}",
+                ]
+                if "CRASH_DATE" in r.index and pd.notna(r["CRASH_DATE"]):
+                    d = r["CRASH_DATE"]
+                    pop_parts.append(
+                        f"Date: {d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else d}"
+                    )
+                if "borough" in r.index and pd.notna(r["borough"]) and str(r["borough"]):
+                    pop_parts.append(f"Borough: {r['borough']}")
+                folium.CircleMarker(
+                    location=[float(r["LATITUDE"]), float(r["LONGITUDE"])],
+                    radius=5,
+                    color=col,
+                    fill=True,
+                    fillColor=col,
+                    fillOpacity=0.5,
+                    weight=1,
+                    popup=folium.Popup("<br>".join(pop_parts), max_width=220),
+                ).add_to(cluster)
+            crash_group.add_to(m)
+            folium.LayerControl(position="topright", collapsed=True).add_to(m)
+
+    folium.Marker(
+        [lat, lon],
+        popup="Lat/lon from the form",
+        tooltip="Selected coordinates",
+        icon=folium.Icon(color="blue", icon="info-sign"),
+    ).add_to(m)
+    Fullscreen().add_to(m)
+    MousePosition().add_to(m)
+    components.html(m._repr_html_(), height=height)
+
+    if total_geo > 0:
+        shown = min(total_geo, max_c)
+        return (
+            f"Showing {shown:,} crashes on the map"
+            + (
+                f" (out of {total_geo:,} with coordinates in your current filters)"
+                if shown < total_geo
+                else " — that’s everything geocoded in your filters"
+            )
+            + " Amber = serious; gray = not serious."
+        )
+    return None
+
+
+def render_prediction_ui(model_info: Dict[str, Any], collisions_view: pd.DataFrame) -> None:
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Risk model</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Pick a time and place. The model estimates how often a crash like that would be labeled serious "
+        "(someone killed, or two or more injured). It’s only as good as the data you loaded — don’t use it for insurance or legal decisions."
+    )
+
+    if "risk_lat" not in st.session_state:
+        st.session_state.risk_lat = 40.7128
+    if "risk_lon" not in st.session_state:
+        st.session_state.risk_lon = -74.0060
+
+    st.markdown('<p class="nyc-control-label">When</p>', unsafe_allow_html=True)
+    g1, g2, g3 = st.columns([1.35, 1.0, 1.1])
+    with g1:
+        hour = st.slider(
+            "Hour",
+            0,
+            23,
+            12,
+            help="Hour on the clock, same way NYC recorded it in the file.",
+        )
+    with g2:
+        day = st.selectbox("Weekday", WEEKDAYS, index=0)
+    with g3:
+        month = st.selectbox("Month", MONTHS, index=0)
+
+    st.caption("Or jump to a rough borough center (fills latitude and longitude below)")
+    bp = st.columns(5)
+    for i, (full, plat, plon, _) in enumerate(BOROUGH_MAP_STYLE):
+        with bp[i]:
+            if st.button(
+                full,
+                key=f"risk_bp_{i}",
+                help=f"Approximate center of {full} ({plat:.4f}, {plon:.4f})",
+                use_container_width=True,
+            ):
+                st.session_state.risk_lat = plat
+                st.session_state.risk_lon = plon
+                st.rerun()
+
+    st.markdown('<p class="nyc-control-label">Where</p>', unsafe_allow_html=True)
+    g4, g5 = st.columns(2)
+    with g4:
+        st.number_input("Latitude", format="%.4f", step=0.0001, key="risk_lat")
+    with g5:
+        st.number_input("Longitude", format="%.4f", step=0.0001, key="risk_lon")
+
+    nlat = float(st.session_state.risk_lat)
+    nlon = float(st.session_state.risk_lon)
+
+    day_num = DAY_TO_NUM[day]
+    month_num = MONTH_TO_NUM[month]
+    is_weekend = 1 if day_num in (5, 6) else 0
+    is_rush = 1 if (7 <= hour <= 9) or (17 <= hour <= 19) else 0
+    is_night = 1 if hour >= 22 or hour <= 5 else 0
+    is_holiday = 1 if month_num in (11, 12, 1) else 0
+    flags = []
+    if is_weekend:
+        flags.append("Weekend")
+    if is_rush:
+        flags.append("Rush hour")
+    if is_night:
+        flags.append("Night")
+    if is_holiday:
+        flags.append("Holiday-season stretch (Nov–Jan)")
+    st.caption(
+        "The model also sees: "
+        + (", ".join(flags) if flags else "weekday, off-peak, daytime")
+    )
+
+    if not model_info or "best_model" not in model_info:
+        st.warning(
+            "No model right now. You need scikit-learn, at least 1,000 rows after cleaning, and a successful training run."
+        )
+        if MAP_AVAILABLE:
+            nocol, mapcol = st.columns([1, 1])
+            with nocol:
+                st.caption(
+                    "You can still move the map and coordinates above. The number next to the map appears when training works."
+                )
+            with mapcol:
+                st.caption("Crashes use your filters (clustered). Blue marker = your lat/lon.")
+                crash_caption = _folium_risk_map(
+                    nlat, nlon, height=320, collisions=collisions_view
+                )
+                if crash_caption:
+                    st.caption(crash_caption)
         return
-    
-    # Display key metrics
-    st.markdown("### 📈 Key Metrics")
-    
-    metric_cols = st.columns(5)
-    metrics = [
-        ("Total Accidents", f"{len(data):,}"),
-        ("Total Injuries", f"{data['total_injured'].sum():,}"),
-        ("Total Fatalities", f"{data['total_killed'].sum():,}"),
-        ("Serious Rate", f"{data['is_serious'].mean():.1%}"),
-        ("Avg Risk Score", f"{data['risk_score'].mean():.1f}")
-    ]
-    
-    for i, (label, value) in enumerate(metrics):
-        with metric_cols[i]:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-value">{value}</div>
-                <div class="metric-label">{label}</div>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Train ML models
-    model_info = {}
-    if ML_AVAILABLE:
-        with st.spinner("🤖 Training AI models..."):
-            model_info = train_enhanced_models(data)
-        
-        if model_info:
-            st.success(f"✅ AI models trained successfully! Best model: {model_info.get('best_model_name', 'Unknown')}")
+
+    feats = [hour, day_num, month_num, is_weekend, is_rush, is_night, is_holiday]
+    if "LATITUDE" in model_info["feature_names"]:
+        feats.extend([nlat, nlon])
+    try:
+        model = model_info["best_model"]
+        proba = float(model.predict_proba([feats])[0][1])
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Prediction error: {exc}")
+        return
+
+    if proba >= 0.7:
+        label, hint = "High", "Above 70% on this model’s scale."
+    elif proba >= 0.4:
+        label, hint = "Medium", "Between 40% and 70%."
+    else:
+        label, hint = "Low", "Below 40%."
+
+    st.markdown(
+        '<div class="nyc-estimate-anchor"><h3>Result</h3></div>',
+        unsafe_allow_html=True,
+    )
+    est_col, map_col = st.columns([1.05, 1])
+    with est_col:
+        m1, m2, m3 = st.columns([1.15, 1.0, 1.25])
+        with m1:
+            st.metric(
+                "P(serious)",
+                f"{proba:.1%}",
+                help="Estimated probability of the serious label. Model chosen by ROC AUC on a held-out test set.",
+            )
+        with m2:
+            st.metric("Bucket", label, help=hint)
+        with m3:
+            st.caption("Same value as a 0–100% bar")
+            st.progress(min(max(proba, 0.0), 1.0))
+        st.caption(hint)
+    with map_col:
+        if MAP_AVAILABLE:
+            st.caption(
+                "Dots are crashes that match your filters (clustered when zoomed out). "
+                "Small circles mark borough centers; the blue marker is your latitude and longitude."
+            )
+            crash_caption = _folium_risk_map(
+                nlat, nlon, height=360, collisions=collisions_view
+            )
+            if crash_caption:
+                st.caption(crash_caption)
         else:
-            st.warning("⚠️ Could not train ML models with current data")
-    
-    # Main tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🎯 AI Prediction", 
-        "📊 Time Analysis", 
-        "🗺️ Geography", 
-        "🔍 Data Explorer"
-    ])
-    
-    with tab1:
-        create_enhanced_prediction_interface(model_info)
-    
-    with tab2:
-        create_enhanced_time_analysis(data)
-    
-    with tab3:
-        create_enhanced_geographic_analysis(data)
-    
-    with tab4:
-        create_enhanced_data_explorer(data)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-    <div style="text-align: center; padding: 1rem; color: #718096;">
-        🚗 NYC Collisions AI Dashboard | Powered by Advanced Machine Learning<br>
-        Data source: <a href="https://data.cityofnewyork.us/Public-Safety/Motor-Vehicle-Collisions-Crashes/h9gi-nx95" 
-        style="color: #667eea;">NYC Open Data</a>
-    </div>
-    """, unsafe_allow_html=True)
+            st.caption("Install the `folium` package to show the map.")
+
+    with st.expander("Models and test scores", expanded=False):
+        st.write(f"Using: {model_info['best_model_name']}")
+        st.caption("ROC AUC on 20% of the data held out after training. Higher means better ranking, not perfect predictions.")
+        for name, info in model_info.get("models", {}).items():
+            st.write(f"- {name}: {info['score']:.3f}")
+
+
+def render_time_charts(view: pd.DataFrame) -> None:
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Over time</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "First chart: crash count by hour (bars) and share that were serious (line). Left axis is count, right axis is share."
+    )
+    h = view.groupby("hour").agg({"is_serious": ["count", "mean"]}).round(4)
+    h.columns = ["total", "serious_rate"]
+    h = h.reset_index()
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=h["hour"],
+            y=h["total"],
+            name="Crash count",
+            marker_color=CHART["bar_volume"],
+            hovertemplate="Hour %{x}<br>Count %{y:,}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=h["hour"],
+            y=h["serious_rate"],
+            name="Serious share",
+            mode="lines+markers",
+            line=dict(color=CHART["serious_line"], width=2),
+            hovertemplate="Hour %{x}<br>Serious share %{y:.1%}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.update_layout(
+        **_plotly_layout_base(
+            "Crashes by hour: volume and serious share",
+            "Crash count (n)",
+            "Serious share (proportion)",
+        )
+    )
+    fig.update_xaxes(title_text="Hour of day (0–23)", dtick=2)
+    st.plotly_chart(fig, use_container_width=True)
+
+    if px is None:
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        daily = view.groupby(["day_name", "day_of_week"]).size().reset_index(name="count")
+        daily = daily.sort_values("day_of_week")
+        fig2 = px.bar(
+            daily,
+            x="day_name",
+            y="count",
+            title="Crashes by weekday",
+            labels={"day_name": "Weekday", "count": "Count (n)"},
+            color_discrete_sequence=[CHART["accent"]],
+        )
+        fig2.update_layout(**{k: v for k, v in _plotly_layout_base("", "Count", None).items() if k != "title"})
+        fig2.update_layout(title={"text": "Crashes by weekday", "font": {"size": 16}})
+        st.plotly_chart(fig2, use_container_width=True)
+    with c2:
+        monthly = view.groupby(["month", "month_name"]).size().reset_index(name="count")
+        monthly = monthly.sort_values("month")
+        fig3 = px.line(
+            monthly,
+            x="month_name",
+            y="count",
+            title="Crashes by month",
+            markers=True,
+            labels={"month_name": "Month", "count": "Count (n)"},
+        )
+        fig3.update_traces(line=dict(color=CHART["accent"]))
+        fig3.update_layout(**{k: v for k, v in _plotly_layout_base("", "Count", None).items() if k != "title"})
+        fig3.update_layout(title={"text": "Crashes by month", "font": {"size": 16}})
+        fig3.update_xaxes(tickangle=35)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    cond = view.groupby(["is_weekend", "is_rush_hour", "is_night"])["is_serious"].mean().reset_index()
+    cond["label"] = cond.apply(
+        lambda r: f"{'Wknd' if r['is_weekend'] else 'Wkdy'} / "
+        f"{'Rush' if r['is_rush_hour'] else 'Off'} / "
+        f"{'Night' if r['is_night'] else 'Day'}",
+        axis=1,
+    )
+    fig4 = px.bar(
+        cond,
+        x="label",
+        y="is_serious",
+        title="Serious share: weekend, rush hour, night",
+        labels={"label": "Context (weekday · rush · night)", "is_serious": "Serious share"},
+        color="is_serious",
+        color_continuous_scale=[[0, CHART["bar_volume"]], [1, CHART["serious_line"]]],
+    )
+    fig4.update_layout(**{k: v for k, v in _plotly_layout_base("", "Serious share", None).items() if k != "title"})
+    fig4.update_layout(title={"text": "Serious share by weekend, rush, night", "font": {"size": 16}})
+    fig4.update_yaxes(tickformat=".0%")
+    fig4.update_xaxes(tickangle=25)
+    st.plotly_chart(fig4, use_container_width=True)
+
+
+def render_geo(view: pd.DataFrame) -> None:
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Map</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Borough comes from latitude and longitude using simple bounding boxes. "
+        "Heat intensity follows the app’s risk score (casualties and time), not anything published by the city."
+    )
+
+    if "borough" in view.columns and len(view) > 0:
+        bs = (
+            view.groupby("borough")
+            .agg({"is_serious": ["count", "mean", "sum"], "risk_score": "mean"})
+            .round(4)
+        )
+        bs.columns = ["total", "serious_rate", "serious_n", "avg_risk"]
+        bs = bs.reset_index().sort_values("total", ascending=False)
+        g1, g2 = st.columns(2)
+        with g1:
+            f1 = go.Figure(
+                data=[
+                    go.Bar(
+                        x=bs["borough"],
+                        y=bs["total"],
+                        name="Count",
+                        marker_color=CHART["accent"],
+                        hovertemplate="%{x}<br>Count %{y:,}<extra></extra>",
+                    )
+                ]
+            )
+            f1.update_layout(
+                **_plotly_layout_base("Crashes by borough", "Count (n)", None),
+            )
+            st.plotly_chart(f1, use_container_width=True)
+        with g2:
+            f2 = go.Figure(
+                data=[
+                    go.Bar(
+                        x=bs["borough"],
+                        y=bs["serious_rate"],
+                        name="Serious share",
+                        marker_color=CHART["serious_line"],
+                        hovertemplate="%{x}<br>Serious share %{y:.1%}<extra></extra>",
+                    )
+                ]
+            )
+            f2.update_layout(
+                **_plotly_layout_base("Serious share by borough", "Serious share", None),
+            )
+            f2.update_yaxes(tickformat=".0%")
+            st.plotly_chart(f2, use_container_width=True)
+
+    if not MAP_AVAILABLE:
+        st.info("Install `folium` to show the map.")
+        return
+
+    cfg = get_app_config()
+    md = view.dropna(subset=["LATITUDE", "LONGITUDE"])
+    if len(md) > cfg["map_sample_size"]:
+        md = md.sample(n=cfg["map_sample_size"], random_state=42)
+        st.caption(
+            f"Showing a random {cfg['map_sample_size']:,} crashes with coordinates so the page stays responsive."
+        )
+    if md.empty:
+        st.warning("No latitude or longitude in this filter. Try widening years or boroughs.")
+        return
+    heat = [
+        [r["LATITUDE"], r["LONGITUDE"], r["risk_score"]]
+        for _, r in md.iterrows()
+        if pd.notna(r["LATITUDE"]) and pd.notna(r["LONGITUDE"])
+    ]
+    m = folium.Map(location=[40.7128, -74.0060], zoom_start=10, tiles="CartoDB positron")
+    if heat:
+        HeatMap(heat, radius=12, max_zoom=12).add_to(m)
+    for name, lat, lon, color in BOROUGH_MAP_STYLE:
+        folium.CircleMarker(
+            [lat, lon],
+            radius=8,
+            popup=name,
+            tooltip=name,
+            color=color,
+            fill=True,
+            fillColor=color,
+            fillOpacity=0.5,
+            weight=2,
+        ).add_to(m)
+    Fullscreen().add_to(m)
+    components.html(m._repr_html_(), height=480)
+
+
+def render_data_export(view: pd.DataFrame, full: pd.DataFrame) -> None:
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Export</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"{len(view):,} rows with your current filters (out of {len(full):,} after cleaning). "
+        "The CSV matches what the charts use."
+    )
+    u1, u2, u3 = st.columns(3)
+    with u1:
+        st.metric("Injuries (sum)", f"{view['total_injured'].sum():,.0f}")
+    with u2:
+        st.metric("Fatalities (sum)", f"{view['total_killed'].sum():,.0f}")
+    with u3:
+        st.metric("Serious share", f"{view['is_serious'].mean():.1%}")
+
+    cols = [
+        c
+        for c in [
+            "CRASH_DATE",
+            "CRASH_TIME",
+            "borough",
+            "LATITUDE",
+            "LONGITUDE",
+            "total_injured",
+            "total_killed",
+            "is_serious",
+            "risk_score",
+            "hour",
+            "year",
+        ]
+        if c in view.columns
+    ]
+    show = st.toggle("Show first 500 rows", value=False)
+    if show:
+        st.dataframe(view[cols].head(500), use_container_width=True, height=320)
+
+    csv_buf = io.StringIO()
+    view[cols].to_csv(csv_buf, index=False)
+    st.download_button(
+        label="Download CSV",
+        data=csv_buf.getvalue(),
+        file_name="nyc_collisions_filtered.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def main() -> None:
+    cfg = get_app_config()
+
+    st.markdown('<p class="nyc-page-title">NYC motor vehicle crashes</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="nyc-lead">Browse the city’s crash export: filter by year and borough, look at timing and maps, '
+        "try a simple model that guesses how often a crash counts as serious, and download a CSV if you need it. "
+        "Public data only; this isn’t official analysis from DOT or NYPD.</p>",
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown("### How many rows to load")
+        st.caption("Smaller loads are faster; raise the cap if you have RAM and want more history.")
+        cap = st.slider(
+            "Max rows from file",
+            min_value=cfg["data_sample_min"],
+            max_value=cfg["data_sample_max"],
+            value=min(cfg["data_sample_default"], cfg["data_sample_max"]),
+            step=5_000,
+            help="Random sample before cleaning (seed 42) when the file is bigger than this.",
+        )
+        if st.button("Reload file (clear cache)", use_container_width=True):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+
+    if not os.path.isfile(DATA_FILE):
+        st.error(f"Can’t find `{DATA_FILE}` in this folder.")
+        st.markdown(
+            f"- Download from [NYC Open Data]({NYC_OPEN_DATA_URL}).\n"
+            "- Save it here with that name, or rename your file to match."
+        )
+        return
+
+    mtime = os.path.getmtime(DATA_FILE)
+    with st.spinner("Loading CSV and cleaning dates…"):
+        pack = load_collision_data(cap, DATA_FILE, mtime)
+
+    if pack.get("error") == "missing_file":
+        st.error("The file was there and then it wasn’t. Check the path and try again.")
+        return
+    if pack.get("error") == "schema":
+        st.error(
+            "This file doesn’t look like the NYC crashes export. We need crash date and time columns "
+            "(spaces or underscores both work — e.g. `CRASH DATE` or `CRASH_DATE`)."
+        )
+        return
+    if pack.get("error") and str(pack["error"]).startswith("load_failed"):
+        st.error("Couldn’t read the file. Close it in other apps if it’s open, or check that it’s a valid CSV.")
+        st.code(str(pack["error"]))
+        return
+
+    data = pack["df"]
+    if data.empty:
+        st.warning(
+            "No rows left after cleaning. The date or time columns may not parse, or the file might be empty."
+        )
+        return
+
+    y_min, y_max = int(data["year"].min()), int(data["year"].max())
+    b_opts = sorted(data["borough"].dropna().unique().tolist()) if "borough" in data.columns else []
+
+    st.markdown(
+        '<p class="nyc-section-kicker nyc-kicker-tight">Filters</p>',
+        unsafe_allow_html=True,
+    )
+    f1, f2, f3 = st.columns((1, 1, 1))
+    with f1:
+        yr = st.slider("Years", y_min, y_max, (y_min, y_max))
+    with f2:
+        bor = st.multiselect(
+            "Borough",
+            options=b_opts,
+            default=b_opts,
+            help="Assigned from coordinates. Uncheck to exclude Unknown or other areas.",
+        )
+    with f3:
+        sev = st.selectbox(
+            "Severity",
+            ["All", "Serious only", "Non-serious only"],
+            help="Serious: at least one death, or two or more injuries.",
+        )
+
+    view = apply_view_filters(data, yr[0], yr[1], bor, sev)
+    if view.empty:
+        st.warning(
+            "No rows match. Try a wider year range, select more boroughs, or set severity to All."
+        )
+        render_methodology_block(DATA_FILE, pack)
+        return
+
+    st.markdown('<p class="nyc-section-kicker">Summary</p>', unsafe_allow_html=True)
+    mcols = st.columns(5)
+    metrics = [
+        ("Crashes in view", f"{len(view):,}"),
+        ("People hurt (total)", f"{view['total_injured'].sum():,.0f}"),
+        ("Lives lost (total)", f"{view['total_killed'].sum():,.0f}"),
+        ("Serious share", f"{view['is_serious'].mean():.1%}"),
+        ("Days covered", f"{(view['CRASH_DATE'].max() - view['CRASH_DATE'].min()).days:,}"),
+    ]
+    for i, (lab, val) in enumerate(metrics):
+        with mcols[i]:
+            st.metric(lab, val)
+
+    st.divider()
+    render_methodology_block(DATA_FILE, pack)
+
+    model_info: Dict[str, Any] = {}
+    if ML_AVAILABLE:
+        with st.spinner("Training models…"):
+            raw_models = train_models(data)
+        # Do not mutate @st.cache_resource return value
+        te = raw_models.get("_train_error") if isinstance(raw_models, dict) else None
+        model_info = {
+            k: v
+            for k, v in (raw_models or {}).items()
+            if k != "_train_error"
+        }
+        if te:
+            st.warning("Model training failed. Charts, map, and export still work; the risk tab won’t show a score.")
+            st.caption(te)
+            model_info = {}
+        elif model_info:
+            st.caption(
+                f"Fit on {len(data):,} cleaned rows; 20% held out for scoring. "
+                f"Best ROC AUC: {model_info.get('best_model_name', '')}."
+            )
+
+    tab_risk, tab_time, tab_map, tab_data = st.tabs(
+        ["Risk", "Time", "Map", "Export"]
+    )
+    with tab_risk:
+        render_prediction_ui(model_info, view)
+    with tab_time:
+        if len(view) < 10:
+            st.info("Need at least 10 rows for these charts. Relax the filters.")
+        else:
+            render_time_charts(view)
+    with tab_map:
+        render_geo(view)
+    with tab_data:
+        render_data_export(view, data)
+
+    st.divider()
+    st.caption(
+        f"Data: [NYC Open Data]({NYC_OPEN_DATA_URL}). "
+        "For exploration only, not official safety planning."
+    )
+
 
 if __name__ == "__main__":
     main()

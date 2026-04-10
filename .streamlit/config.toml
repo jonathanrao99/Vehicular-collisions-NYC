@@ -1,3 +1,6 @@
+# Streamlit theme — tokens referenced in README (UI theme section).
+# Accent: primaryColor. Neutrals: background + secondaryBackground + textColor.
+
 [server]
 headless = true
 enableCORS = false
@@ -7,7 +10,9 @@ port = 8501
 gatherUsageStats = false
 
 [theme]
-primaryColor = "#1f77b4"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
-textColor = "#262730"
+base = "light"
+primaryColor = "#0f766e"
+backgroundColor = "#fafafa"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1e293b"
+font = "sans serif"
