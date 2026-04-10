@@ -13,13 +13,13 @@ Streamlit UI and a Jupyter notebook for NYC’s published [Motor Vehicle Collisi
 - `requirements.txt` — Python dependencies  
 - `.streamlit/config.toml` — light theme and accent color  
 
-Put `Motor_Vehicle_Collisions_-_Crashes.csv` in the project root (gitignored by default).
+Optional: put `Motor_Vehicle_Collisions_-_Crashes.csv` in the project root (gitignored by default). Get it from NYC Open Data or the [Kaggle mirror](https://www.kaggle.com/datasets/tush32/motor-vehicle-collisions-crashes). If the file is missing (e.g. on Streamlit Cloud), the app downloads the newest rows from NYC Open Data’s API instead, up to your row cap.
 
 ## Setup
 
 - Python 3.8+ and enough RAM for a multi‑million row CSV, or use the app’s row cap.  
 - `pip install -r requirements.txt`  
-- Download the crashes CSV from NYC Open Data and name it as above.
+- Download the crashes CSV from [NYC Open Data](https://data.cityofnewyork.us/Public-Safety/Motor-Vehicle-Collisions-Crashes/h9gi-nx95) or the [Kaggle mirror](https://www.kaggle.com/datasets/tush32/motor-vehicle-collisions-crashes) and name it as above.
 
 ## Run
 
@@ -57,9 +57,9 @@ streamlit run streamlit_app.py --server.port 8501
 ```
 
 ### Streamlit Cloud
-1. Push code to GitHub
-2. Connect repository to [share.streamlit.io](https://share.streamlit.io)
-3. Deploy automatically
+1. Push code to GitHub (you do **not** need to commit the CSV).
+2. Connect the repository to [share.streamlit.io](https://share.streamlit.io) and deploy.
+3. Optional: under app **Secrets**, add `NYC_OPEN_DATA_APP_TOKEN` with a [free app token](https://data.cityofnewyork.us/profile/edit/developer_settings) if you hit rate limits when loading large row caps.
 
 ### Docker (optional)
 ```bash
@@ -69,7 +69,7 @@ docker run -p 8501:8501 nyc-collisions
 
 ## Data
 
-Source: [Motor Vehicle Collisions – Crashes](https://data.cityofnewyork.us/Public-Safety/Motor-Vehicle-Collisions-Crashes/h9gi-nx95) on NYC Open Data. Fields include crash date/time, coordinates when present, injury and fatality counts, contributing factors, and vehicle types. Coverage and quality depend on how incidents are reported.
+Source: [Motor Vehicle Collisions – Crashes](https://data.cityofnewyork.us/Public-Safety/Motor-Vehicle-Collisions-Crashes/h9gi-nx95) on NYC Open Data. A downloadable CSV mirror is also on [Kaggle](https://www.kaggle.com/datasets/tush32/motor-vehicle-collisions-crashes). Fields include crash date/time, coordinates when present, injury and fatality counts, contributing factors, and vehicle types. Coverage and quality depend on how incidents are reported.
 
 ## Contributing
 
@@ -77,7 +77,7 @@ Issues and PRs welcome. For bugs, include OS, Python version, and how to reprodu
 
 ## Troubleshooting
 
-- **CSV not found** — file name and location must match above; check permissions.  
+- **CSV not found (local)** — file name and location must match above; check permissions. On Streamlit Cloud, missing CSV is expected; the app uses the live API.  
 - **Models** — `pip install scikit-learn`; optional `xgboost`, `lightgbm`. On some Macs you may need OpenMP (`brew install libomp`) for XGBoost.  
 - **Maps** — `pip install folium`; tiles need network access.  
 - **Slow or OOM** — lower `max_rows` in the sidebar and smaller ML sample sizes.
@@ -96,4 +96,4 @@ MIT — see `LICENSE`.
 
 ## Credits
 
-NYC Open Data for the dataset; Streamlit, scikit-learn, Plotly, and Folium for the stack used here.
+NYC Open Data for the dataset; [Kaggle mirror](https://www.kaggle.com/datasets/tush32/motor-vehicle-collisions-crashes) for an easy CSV download; Streamlit, scikit-learn, Plotly, and Folium for the stack used here.

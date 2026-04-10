@@ -10,6 +10,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +33,49 @@ NYC_OPEN_DATA_URL = (
     "https://data.cityofnewyork.us/Public-Safety/"
     "Motor-Vehicle-Collisions-Crashes/h9gi-nx95"
 )
+# Community mirror of the same NYC export (handy for a single downloadable file).
+KAGGLE_DATASET_URL = "https://www.kaggle.com/datasets/tush32/motor-vehicle-collisions-crashes"
+# Socrata API (same dataset) — used when ``Motor_Vehicle_Collisions_-_Crashes.csv`` is not in the app (e.g. Streamlit Cloud).
+SOCRATA_CRASHES_URL = "https://data.cityofnewyork.us/resource/h9gi-nx95.json"
+SOCRATA_PAGE_SIZE = 50_000
+
+# API field names (lowercase) → same column labels as the published CSV export (for existing preprocessing).
+SOCRATA_TO_CSV_COLUMNS: Dict[str, str] = {
+    "crash_date": "CRASH_DATE",
+    "crash_time": "CRASH_TIME",
+    "borough": "BOROUGH",
+    "zip_code": "ZIP CODE",
+    "latitude": "LATITUDE",
+    "longitude": "LONGITUDE",
+    "location": "LOCATION",
+    "on_street_name": "ON STREET NAME",
+    "cross_street_name": "CROSS STREET NAME",
+    "off_street_name": "OFF STREET NAME",
+    "number_of_persons_injured": "NUMBER OF PERSONS INJURED",
+    "number_of_persons_killed": "NUMBER OF PERSONS KILLED",
+    "number_of_pedestrians_injured": "NUMBER OF PEDESTRIANS INJURED",
+    "number_of_pedestrians_killed": "NUMBER OF PEDESTRIANS KILLED",
+    "number_of_cyclist_injured": "NUMBER OF CYCLIST INJURED",
+    "number_of_cyclist_killed": "NUMBER OF CYCLIST KILLED",
+    "number_of_motorist_injured": "NUMBER OF MOTORIST INJURED",
+    "number_of_motorist_killed": "NUMBER OF MOTORIST KILLED",
+    "contributing_factor_vehicle_1": "CONTRIBUTING FACTOR VEHICLE 1",
+    "contributing_factor_vehicle_2": "CONTRIBUTING FACTOR VEHICLE 2",
+    "contributing_factor_vehicle_3": "CONTRIBUTING FACTOR VEHICLE 3",
+    "contributing_factor_vehicle_4": "CONTRIBUTING FACTOR VEHICLE 4",
+    "contributing_factor_vehicle_5": "CONTRIBUTING FACTOR VEHICLE 5",
+    "collision_id": "COLLISION_ID",
+    "vehicle_type_code1": "VEHICLE TYPE CODE 1",
+    "vehicle_type_code2": "VEHICLE TYPE CODE 2",
+    "vehicle_type_code3": "VEHICLE TYPE CODE 3",
+    "vehicle_type_code4": "VEHICLE TYPE CODE 4",
+    "vehicle_type_code5": "VEHICLE TYPE CODE 5",
+    "vehicle_type_code_1": "VEHICLE TYPE CODE 1",
+    "vehicle_type_code_2": "VEHICLE TYPE CODE 2",
+    "vehicle_type_code_3": "VEHICLE TYPE CODE 3",
+    "vehicle_type_code_4": "VEHICLE TYPE CODE 4",
+    "vehicle_type_code_5": "VEHICLE TYPE CODE 5",
+}
 
 # Plotly semantic colors — align with [theme] primaryColor in config.toml (#0f766e)
 CHART = {
@@ -107,7 +152,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        "About": f"Data source: NYC Open Data ({NYC_OPEN_DATA_URL})",
+        "About": (
+            f"Data: NYC Open Data ({NYC_OPEN_DATA_URL}) · "
+            f"CSV mirror on Kaggle ({KAGGLE_DATASET_URL})"
+        ),
     },
 )
 
@@ -358,6 +406,7 @@ def load_collision_data(sample_size: Optional[int], path: str, file_mtime: float
         "error": None,
         "rows_read": 0,
         "rows_after_clean": 0,
+        "source": "file",
     }
     try:
         if not os.path.isfile(path):
@@ -377,6 +426,90 @@ def load_collision_data(sample_size: Optional[int], path: str, file_mtime: float
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"load_failed:{exc}"
     return out
+
+
+def _http_get_socrata_json(url: str, app_token: str) -> Any:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "NYC-motor-vehicle-crashes-streamlit/1.0",
+            "Accept": "application/json",
+        },
+    )
+    tok = (app_token or "").strip()
+    if tok:
+        req.add_header("X-App-Token", tok)
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _prepare_socrata_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.rename(columns={k: v for k, v in SOCRATA_TO_CSV_COLUMNS.items() if k in df.columns})
+    for c in df.columns:
+        if "NUMBER OF" in c or c in ("LATITUDE", "LONGITUDE", "COLLISION_ID"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=get_app_config()["cache_ttl"], show_spinner=False)
+def load_collision_data_from_api(max_rows: int, app_token: str) -> Dict[str, Any]:
+    """Fetch crash rows from NYC Open Data (Socrata), newest crash_date first, up to max_rows."""
+    out: Dict[str, Any] = {
+        "df": pd.DataFrame(),
+        "error": None,
+        "rows_read": 0,
+        "rows_after_clean": 0,
+        "source": "api",
+    }
+    try:
+        want = max(1, int(max_rows))
+        rows_accum: List[Dict[str, Any]] = []
+        offset = 0
+        while len(rows_accum) < want:
+            chunk_sz = min(SOCRATA_PAGE_SIZE, want - len(rows_accum))
+            url = (
+                f"{SOCRATA_CRASHES_URL}?$limit={chunk_sz}&$offset={offset}"
+                "&$order=crash_date DESC"
+            )
+            chunk = _http_get_socrata_json(url, app_token)
+            if not isinstance(chunk, list) or not chunk:
+                break
+            rows_accum.extend(chunk)
+            offset += len(chunk)
+            if len(chunk) < chunk_sz:
+                break
+        df = pd.DataFrame(rows_accum)
+        if df.empty:
+            out["error"] = "api_empty"
+            return out
+        df = _prepare_socrata_dataframe(df)
+        df = _normalize_collision_df_columns(df)
+        if "CRASH_DATE" not in df.columns or "CRASH_TIME" not in df.columns:
+            out["error"] = "schema"
+            return out
+        out["rows_read"] = len(df)
+        df = _preprocess_collision_df(df)
+        out["df"] = df
+        out["rows_after_clean"] = len(df)
+    except urllib.error.HTTPError as exc:
+        out["error"] = f"load_failed:HTTP {exc.code} — {exc.reason}"
+    except urllib.error.URLError as exc:
+        out["error"] = f"load_failed:network {exc.reason!s}"
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"load_failed:{exc}"
+    return out
+
+
+def _socrata_app_token() -> str:
+    env = os.environ.get("NYC_OPEN_DATA_APP_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        return str(st.secrets["NYC_OPEN_DATA_APP_TOKEN"]).strip()
+    except Exception:
+        return ""
 
 
 def apply_view_filters(
@@ -698,6 +831,30 @@ def render_methodology_block(path: str, pack: Dict[str, Any]) -> None:
     )
     size_mb = f"{stat.st_size / (1024**2):.1f} MB" if stat else "—"
 
+    src = pack.get("source", "file")
+    if src == "api":
+        origin_li = (
+            f'<li><strong>Live data:</strong> Loaded from the '
+            f'<a href="{SOCRATA_CRASHES_URL}" target="_blank" rel="noopener">Socrata API</a> '
+            f"(newest crashes first), up to your sidebar row cap. No CSV is bundled with this deployment.</li>"
+        )
+        row_cap_li = (
+            "<li><strong>Row cap:</strong> The API returns at most that many recent records (no extra random sample). "
+            "If requests are throttled, add <code>NYC_OPEN_DATA_APP_TOKEN</code> under Streamlit "
+            "<strong>Secrets</strong> (free from NYC Open Data).</li>"
+        )
+        rows_read_note = "pulled from the API"
+    else:
+        origin_li = (
+            f'<li><strong>Local file:</strong> <code>{path}</code> · modified <strong>{modified}</strong> · '
+            f"size about <strong>{size_mb}</strong>.</li>"
+        )
+        row_cap_li = (
+            "<li><strong>Row cap:</strong> If you set a max below the file size, we take a random sample "
+            "(always seed 42) before cleaning.</li>"
+        )
+        rows_read_note = "read from the file"
+
     st.markdown('<p class="nyc-section-kicker">Notes</p>', unsafe_allow_html=True)
     with st.expander("Where the data comes from and what we changed", expanded=False):
         st.markdown(
@@ -706,10 +863,10 @@ def render_methodology_block(path: str, pack: Dict[str, Any]) -> None:
 <p>This app reads NYC’s published motor-vehicle crash file and builds charts and a simple classifier on top.
 Use the filters above, then open each tab for the risk model, time charts, a heat map, or batch model scores and a small model report.</p>
 <ul>
-<li><strong>Dataset:</strong> <a href="{NYC_OPEN_DATA_URL}" target="_blank" rel="noopener">Motor Vehicle Collisions — Crashes</a> on NYC Open Data.</li>
-<li><strong>Local file:</strong> <code>{path}</code> · modified <strong>{modified}</strong> · size about <strong>{size_mb}</strong>.</li>
-<li><strong>Rows:</strong> {pack.get("rows_read", 0):,} read from the file; {pack.get("rows_after_clean", 0):,} kept after dropping rows without a valid date or hour.</li>
-<li><strong>Row cap:</strong> If you set a max below the file size, we take a random sample (always seed 42) before cleaning.</li>
+<li><strong>Dataset:</strong> <a href="{NYC_OPEN_DATA_URL}" target="_blank" rel="noopener">Motor Vehicle Collisions — Crashes</a> on NYC Open Data. For a local CSV you can also use the community mirror on <a href="{KAGGLE_DATASET_URL}" target="_blank" rel="noopener">Kaggle</a> — download and save as <code>{DATA_FILE}</code> in this folder.</li>
+{origin_li}
+<li><strong>Rows:</strong> {pack.get("rows_read", 0):,} {rows_read_note}; {pack.get("rows_after_clean", 0):,} kept after dropping rows without a valid date or hour.</li>
+{row_cap_li}
 <li><strong>Serious crashes:</strong> We label a row serious if someone died or at least two people were injured — that’s what the model predicts.</li>
 <li><strong>Risk score (heat map):</strong> A homemade index from injuries, deaths, and time of day. It isn’t from the city.</li>
 <li><strong>Map tab:</strong> At most {get_app_config()["map_sample_size"]:,} points with coordinates, for speed.</li>
@@ -1739,41 +1896,59 @@ def main() -> None:
         st.markdown("### How many rows to load")
         st.caption("Smaller loads are faster; raise the cap if you have RAM and want more history.")
         cap = st.slider(
-            "Max rows from file",
+            "Max rows to load",
             min_value=cfg["data_sample_min"],
             max_value=cfg["data_sample_max"],
             value=min(cfg["data_sample_default"], cfg["data_sample_max"]),
             step=5_000,
-            help="Random sample before cleaning (seed 42) when the file is bigger than this.",
+            help="With a local CSV: random sample (seed 42) when the file is larger. "
+            "Without a CSV (e.g. cloud): newest records from the API, up to this many.",
         )
         if st.button("Reload file (clear cache)", use_container_width=True):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
 
-    if not os.path.isfile(DATA_FILE):
-        st.error(f"Can’t find `{DATA_FILE}` in this folder.")
-        st.markdown(
-            f"- Download from [NYC Open Data]({NYC_OPEN_DATA_URL}).\n"
-            "- Save it here with that name, or rename your file to match."
+    if os.path.isfile(DATA_FILE):
+        mtime = os.path.getmtime(DATA_FILE)
+        with st.spinner("Loading CSV and cleaning dates…"):
+            pack = load_collision_data(cap, DATA_FILE, mtime)
+    else:
+        st.info(
+            f"No `{DATA_FILE}` in the app folder (normal for Streamlit Cloud). "
+            "Pulling the newest crashes from NYC Open Data up to your row cap."
         )
-        return
-
-    mtime = os.path.getmtime(DATA_FILE)
-    with st.spinner("Loading CSV and cleaning dates…"):
-        pack = load_collision_data(cap, DATA_FILE, mtime)
+        api_cap = min(cap, cfg["data_sample_max"])
+        tok = _socrata_app_token()
+        with st.spinner("Downloading from NYC Open Data…"):
+            pack = load_collision_data_from_api(api_cap, tok)
 
     if pack.get("error") == "missing_file":
         st.error("The file was there and then it wasn’t. Check the path and try again.")
         return
-    if pack.get("error") == "schema":
+    if pack.get("error") == "api_empty":
         st.error(
-            "This file doesn’t look like the NYC crashes export. We need crash date and time columns "
-            "(spaces or underscores both work — e.g. `CRASH DATE` or `CRASH_DATE`)."
+            "NYC Open Data returned no rows. Try again later, lower the row cap, "
+            "or add `NYC_OPEN_DATA_APP_TOKEN` in Streamlit app secrets."
         )
         return
+    if pack.get("error") == "schema":
+        if pack.get("source") == "api":
+            st.error("The API response didn’t contain usable crash date and time fields.")
+        else:
+            st.error(
+                "This file doesn’t look like the NYC crashes export. We need crash date and time columns "
+                "(spaces or underscores both work — e.g. `CRASH DATE` or `CRASH_DATE`)."
+            )
+        return
     if pack.get("error") and str(pack["error"]).startswith("load_failed"):
-        st.error("Couldn’t read the file. Close it in other apps if it’s open, or check that it’s a valid CSV.")
+        if pack.get("source") == "api":
+            st.error(
+                "Couldn’t download or parse NYC Open Data. Check connectivity, try again, "
+                "or set `NYC_OPEN_DATA_APP_TOKEN` in secrets if you’re rate-limited."
+            )
+        else:
+            st.error("Couldn’t read the file. Close it in other apps if it’s open, or check that it’s a valid CSV.")
         st.code(str(pack["error"]))
         return
 
@@ -1900,7 +2075,8 @@ def main() -> None:
 
     st.divider()
     st.caption(
-        f"Data: [NYC Open Data]({NYC_OPEN_DATA_URL}). "
+        f"Data: [NYC Open Data]({NYC_OPEN_DATA_URL}) · "
+        f"[Kaggle CSV mirror]({KAGGLE_DATASET_URL}). "
         "For exploration only, not official safety planning."
     )
 
